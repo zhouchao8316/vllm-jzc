@@ -555,7 +555,13 @@ class Scheduler(SchedulerInterface):
             if request_is_new:
                 scheduler_output.scheduled_new_reqs.append(
                     NewRequestData.from_request(
-                        candidate, new_blocks.get_block_ids()
+                        candidate,
+                        new_blocks.get_block_ids(),
+                        # Model Runner V2 requires prefill_token_ids on new
+                        # requests (see regular schedule path below).
+                        candidate._all_token_ids
+                        if self.use_v2_model_runner
+                        else None,
                     )
                 )
             else:
