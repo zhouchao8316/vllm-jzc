@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -68,6 +69,8 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+_LAYERED_PREFILL_TRACE = os.getenv("VLLM_LAYERED_PREFILL_TRACE") == "1"
 
 
 class Scheduler(SchedulerInterface):
@@ -473,10 +476,10 @@ class Scheduler(SchedulerInterface):
             return self._schedule_regular(throttle_prefills)
 
         query_tokens = candidate.layered_prefill_query_tokens
-        if query_tokens <= 0 or query_tokens >= self.max_num_scheduled_tokens:
+        if query_tokens <= 0 or query_tokens > self.max_num_scheduled_tokens:
             logger.warning_once(
-                "Layered prefill request %s cannot leave token budget for a "
-                "Decode query; falling back to regular scheduling.",
+                "Layered prefill request %s exceeds the token budget; "
+                "falling back to regular scheduling.",
                 candidate.request_id,
             )
             self._reset_or_preempt_layered_request(candidate)
@@ -485,11 +488,12 @@ class Scheduler(SchedulerInterface):
         # Layered prefill is intended to hide P work behind Decode.  Starting
         # a fresh cohort with no Decode work would only add scheduler steps to
         # TTFT, so let the ordinary full-prefill path handle that case.  Once
-        # a cohort has advanced past group 0, it must finish from its saved
-        # frontier even if Decode drains in the meantime.
+        # a cohort has committed prompt tokens, later chunks must finish from
+        # their saved position even if Decode drains in the meantime.
         if (
             self.layered_prefill_policy.config.require_pd_mixed
             and candidate.layered_prefill_group_id == 0
+            and candidate.num_computed_tokens == 0
             and not self._has_layered_decode_work(candidate)
         ):
             self._reset_or_preempt_layered_request(candidate)
@@ -531,9 +535,22 @@ class Scheduler(SchedulerInterface):
             if len(self.running) >= self.max_num_running_reqs:
                 self._requeue_layered_candidate(candidate, admission_status)
                 return scheduler_output
+            # Prefix-cache lookup mirrors the regular waiting path.  Cached
+            # blocks are complete for every layer once the producing request
+            # finished its cohort, so layered requests may reuse them.
+            num_computed_tokens = candidate.num_computed_tokens
+            new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
+            if num_computed_tokens == 0:
+                (
+                    new_computed_blocks,
+                    num_computed_tokens,
+                    candidate.shared_prefix_boundary,
+                ) = self.kv_cache_manager.get_computed_blocks(candidate)
             new_blocks = self.kv_cache_manager.allocate_slots(
                 candidate,
-                query_tokens,
+                candidate.num_prompt_tokens - num_computed_tokens,
+                num_new_computed_tokens=num_computed_tokens,
+                new_computed_blocks=new_computed_blocks,
                 num_lookahead_tokens=0,
                 delay_cache_blocks=True,
                 has_scheduled_reqs=bool(self.running),
@@ -543,6 +560,14 @@ class Scheduler(SchedulerInterface):
                     reset_layered_prefill_request(candidate)
                 self._requeue_layered_candidate(candidate, admission_status)
                 return scheduler_output
+            if num_computed_tokens != candidate.num_computed_tokens:
+                candidate.num_computed_tokens = num_computed_tokens
+                # Re-plan the first chunk from the cache-hit position so
+                # only uncached tokens consume query budget.
+                self.layered_prefill_policy.plan_chunk(
+                    candidate, num_computed_tokens
+                )
+                query_tokens = candidate.layered_prefill_query_tokens
             candidate.status = RequestStatus.RUNNING
             self.running.append(candidate)
             self._inflight_prefills.add(candidate)
@@ -556,7 +581,9 @@ class Scheduler(SchedulerInterface):
                 scheduler_output.scheduled_new_reqs.append(
                     NewRequestData.from_request(
                         candidate,
-                        new_blocks.get_block_ids(),
+                        self.kv_cache_manager.get_blocks(
+                            candidate.request_id
+                        ).get_block_ids(),
                         # Model Runner V2 requires prefill_token_ids on new
                         # requests (see regular schedule path below).
                         candidate._all_token_ids
@@ -570,7 +597,13 @@ class Scheduler(SchedulerInterface):
                     [candidate],
                     {candidate.request_id: query_tokens},
                     {},
-                    {candidate.request_id: new_blocks},
+                    # A resumed request must reinstall every block it owns,
+                    # including prefix-cache hits excluded from new_blocks.
+                    {
+                        candidate.request_id: self.kv_cache_manager.get_blocks(
+                            candidate.request_id
+                        )
+                    },
                 )
                 self._append_cached_request_data(
                     scheduler_output.scheduled_cached_reqs, cached
@@ -599,21 +632,36 @@ class Scheduler(SchedulerInterface):
                 scheduler_output.scheduled_cached_reqs, cached
             )
 
-        # The worker must replay the prompt positions [0, query_tokens) for
-        # every layer group.  Keep the scheduler's logical token count (which
-        # is committed only by the final group) separate from the worker input
-        # cursor, otherwise the final group would start at position q and
-        # either read output-token slots or write duplicate KV entries.
+        # The worker must replay the chunk positions
+        # [chunk_start, chunk_start + query_tokens) for every layer group.
+        # Keep the scheduler's logical token count (which is committed only
+        # by the final group) separate from the worker input cursor,
+        # otherwise the final group would start at the committed position
+        # and either read output-token slots or write duplicate KV entries.
         if not request_is_new:
             cached_req_ids = scheduler_output.scheduled_cached_reqs.req_ids
             cached_index = cached_req_ids.index(req_id)
             scheduler_output.scheduled_cached_reqs.num_computed_tokens[
                 cached_index
-            ] = 0
+            ] = candidate.num_computed_tokens
 
         plan = self.layered_prefill_policy.make_plan(candidate)
         scheduler_output.layered_prefill_plan = plan
         candidate.layered_prefill_kv_reserved = True
+        if _LAYERED_PREFILL_TRACE:
+            logger.info(
+                "Layered prefill plan: req=%s chunk_start=%d query=%d "
+                "group=%d/%d layers=[%d,%d) commit=%d final_chunk=%s",
+                req_id,
+                candidate.num_computed_tokens,
+                query_tokens,
+                plan.group_id,
+                plan.num_groups,
+                plan.group_start,
+                plan.group_end,
+                plan.commit_tokens[req_id],
+                plan.is_final_chunk,
+            )
         self._update_after_layered_schedule(candidate, scheduler_output)
         self.prev_step_scheduled_req_ids.add(req_id)
         return scheduler_output
@@ -712,7 +760,7 @@ class Scheduler(SchedulerInterface):
             in (RequestStatus.WAITING, RequestStatus.PREEMPTED, RequestStatus.RUNNING)
             and request.pooling_params is None
             and request.num_prompt_tokens > 0
-            and request.num_computed_tokens == 0
+            and request.num_computed_tokens < request.num_prompt_tokens
             and not request.output_token_ids
             and sampling_params is not None
             and sampling_params.logprobs is None
@@ -730,14 +778,14 @@ class Scheduler(SchedulerInterface):
         )
 
     def _layered_prefill_supported_for_scheduler(self) -> bool:
-        # Phase 1 is intentionally connector-free, prefix-cache-free and
-        # synchronous.  TP ranks consume the same SchedulerOutput through the
-        # normal worker broadcast, so TP does not need a scheduler-side gate;
-        # DP=1 is enforced by the Ascend platform until plan synchronization
-        # across DP/EP ranks is implemented.  Model capability is checked by
-        # the worker.
+        # The layered policy is connector-free and synchronous.  Prefix
+        # caching is supported: admission reuses completed blocks and every
+        # finished chunk publishes its blocks to the cache.  TP ranks consume
+        # the same SchedulerOutput through the normal worker broadcast, so TP
+        # does not need a scheduler-side gate; DP=1 is enforced by the Ascend
+        # platform until plan synchronization across DP/EP ranks is
+        # implemented.  Model capability is checked by the worker.
         parallel_config = self.parallel_config
-        cache_config = self.cache_config
         kv_transfer_config = self.vllm_config.kv_transfer_config
         layered_config = self.layered_prefill_policy.config
         return bool(
@@ -749,7 +797,6 @@ class Scheduler(SchedulerInterface):
                 or getattr(self.vllm_config.model_config, "enforce_eager", False)
             )
             and self.connector is None
-            and not getattr(cache_config, "enable_prefix_caching", False)
             and kv_transfer_config is None
         )
 
@@ -785,7 +832,18 @@ class Scheduler(SchedulerInterface):
             )
         request.layered_prefill_group_id += 1
         if not request.is_prefill_chunk:
-            reset_layered_prefill_request(request)
+            # Every layer group has covered this chunk, so the chunk's KV
+            # blocks are complete for all layers and may enter the prefix
+            # cache even while later chunks are still prefilling.
+            self.kv_cache_manager.cache_blocks(
+                request, request.num_computed_tokens
+            )
+            if request.num_computed_tokens < request.num_prompt_tokens:
+                self.layered_prefill_policy.plan_chunk(
+                    request, request.num_computed_tokens
+                )
+            else:
+                reset_layered_prefill_request(request)
 
     def _schedule_regular(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1

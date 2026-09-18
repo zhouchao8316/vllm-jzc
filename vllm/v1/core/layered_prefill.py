@@ -276,6 +276,7 @@ class LayeredPrefillPlan:
     query_tokens: Mapping[str, int]
     commit_tokens: Mapping[str, int]
     reuse_kv_blocks: bool = True
+    is_final_chunk: bool = True
 
     def __post_init__(self) -> None:
         if self.version != 1:
@@ -325,6 +326,11 @@ class LayeredPrefillPlan:
     @property
     def is_final_group(self) -> bool:
         return self.group_id + 1 == self.num_groups
+
+    @property
+    def is_sampling_step(self) -> bool:
+        """Only the final group of the final prompt chunk produces logits."""
+        return self.is_final_group and self.is_final_chunk
 
     @property
     def layer_range(self) -> LayerGroupRange:
@@ -389,6 +395,10 @@ class LayeredPrefillPolicy:
         self.pipeline_parallel_size = int(
             getattr(parallel_config, "pipeline_parallel_size", 1)
         )
+        scheduler_config = getattr(vllm_config, "scheduler_config", None)
+        self.max_num_batched_tokens = int(
+            getattr(scheduler_config, "max_num_batched_tokens", 0) or 0
+        )
         self._next_cohort_id = 0
 
     @property
@@ -407,9 +417,28 @@ class LayeredPrefillPolicy:
             return
         request.layered_prefill_enabled = True
         request.layered_prefill_cohort_id = self.new_cohort_id()
-        request.layered_prefill_group_id = 0
+        request.layered_prefill_kv_reserved = False
+        self.plan_chunk(request, request.num_computed_tokens)
+
+    def plan_chunk(self, request: Any, chunk_start: int) -> None:
+        """Plan the token chunk and layer-group layout from chunk_start.
+
+        A prompt longer than the per-step token budget is prefilled in
+        max_num_batched_tokens chunks, and every chunk is executed as
+        its own layer-group sequence.  Longer chunks therefore still
+        receive a finer layer-granularity split.
+        """
+
+        remaining = request.num_prompt_tokens - chunk_start
+        if remaining <= 0:
+            raise ValueError(
+                "layered prefill chunk start must leave prompt tokens"
+            )
+        query_tokens = remaining
+        if self.max_num_batched_tokens > 0:
+            query_tokens = min(query_tokens, self.max_num_batched_tokens)
         num_groups = select_num_groups(
-            request.num_prompt_tokens,
+            query_tokens,
             self.num_hidden_layers,
             group_token_target=self.config.group_token_target,
             allowed_num_groups=self.config.allowed_num_groups,
@@ -417,14 +446,16 @@ class LayeredPrefillPolicy:
         if self.pipeline_parallel_size > 1:
             # A group must have one unambiguous PP owner.  Prefer the
             # configured layout, but never allow fewer groups than stages.
-            request.layered_prefill_num_groups = min(
+            num_groups = min(
                 self.num_hidden_layers,
                 max(self.pipeline_parallel_size, num_groups),
             )
-        else:
-            request.layered_prefill_num_groups = num_groups
-        request.layered_prefill_query_tokens = request.num_prompt_tokens
-        request.layered_prefill_kv_reserved = False
+        request.layered_prefill_group_id = 0
+        request.layered_prefill_num_groups = num_groups
+        # Keep the logical query identical to regular chunked prefill.  The
+        # worker pads the physical batch for sequence-sharded execution,
+        # while scheduler bookkeeping and KV commit cover the whole chunk.
+        request.layered_prefill_query_tokens = query_tokens
 
     def make_plan(self, request: Any) -> LayeredPrefillPlan:
         if not getattr(request, "layered_prefill_enabled", False):
@@ -457,6 +488,10 @@ class LayeredPrefillPolicy:
             # allocation; only later groups are true KV-reuse steps.
             reuse_kv_blocks=(
                 request.layered_prefill_kv_reserved and group_id > 0
+            ),
+            is_final_chunk=(
+                request.num_computed_tokens + query_tokens
+                >= request.num_prompt_tokens
             ),
         )
 

@@ -17,17 +17,29 @@ from vllm.v1.core.layered_prefill import (
 )
 
 
-def _config(*, enabled: bool = True, layers: int = 8):
+def _config(
+    *,
+    enabled: bool = True,
+    layers: int = 8,
+    tensor_parallel_size: int = 1,
+    use_sequence_parallel_moe: bool = False,
+):
     return SimpleNamespace(
         model_config=SimpleNamespace(
             num_hidden_layers=layers,
             enforce_eager=True,
         ),
         additional_config={
+            "enable_dsa_cp": False,
             "scheduler_config": {
                 "layered_prefill_config": {"enabled": enabled}
             }
         },
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=tensor_parallel_size,
+            pipeline_parallel_size=1,
+            use_sequence_parallel_moe=use_sequence_parallel_moe,
+        ),
     )
 
 
@@ -169,6 +181,29 @@ def test_policy_aligns_pp_groups_with_stage_partitions():
     assert request.layered_prefill_num_groups == 2
     plan = policy.make_plan(request)
     assert (plan.group_start, plan.group_end) == (0, 4)
+
+
+def test_policy_keeps_unaligned_tail_in_layered_query():
+    config = _config(layers=8, tensor_parallel_size=8)
+    config.model_config.hf_text_config = SimpleNamespace(index_topk=2048)
+    config.additional_config["enable_dsa_cp"] = True
+    policy = LayeredPrefillPolicy(config)
+    request = SimpleNamespace(
+        request_id="req",
+        num_prompt_tokens=65540,
+        layered_prefill_enabled=False,
+        layered_prefill_group_id=0,
+        layered_prefill_num_groups=0,
+        layered_prefill_query_tokens=0,
+        layered_prefill_cohort_id=-1,
+        layered_prefill_kv_reserved=False,
+    )
+
+    policy.initialize_request(request)
+    assert request.layered_prefill_query_tokens == 65540
+
+    plan = policy.make_plan(request)
+    assert plan.query_tokens["req"] == 65540
 
 
 def test_frontier_store_is_keyed_by_request_id():
