@@ -13,11 +13,14 @@ from __future__ import annotations
 from bisect import bisect_left
 from dataclasses import dataclass, field
 from math import ceil
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
+
+from vllm.logger import init_logger
 
 
 DEFAULT_GROUP_TOKEN_TARGET = 512
 DEFAULT_ALLOWED_NUM_GROUPS = (1, 2, 4, 8, 16)
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -38,6 +41,42 @@ class LayerGroupRange:
 
 
 @dataclass(frozen=True)
+class MergedLayerGroup:
+    """Consecutive layer groups fused into one P forward.
+
+    ``group_id`` is the first consumed group.  ``includes_final`` is the
+    sample/commit bit: only a merge that covers the last group may emit
+    the first decode token.  A merge never crosses a PP stage boundary.
+    """
+
+    group_id: int
+    last_group_id: int
+    start: int
+    end: int
+    num_groups_total: int
+
+    def __post_init__(self) -> None:
+        if self.group_id < 0 or self.last_group_id < self.group_id:
+            raise ValueError("invalid merged group ids")
+        if self.start < 0 or self.end <= self.start:
+            raise ValueError(f"invalid merged layer range [{self.start}, {self.end})")
+        if self.num_groups_total <= 0 or self.last_group_id >= self.num_groups_total:
+            raise ValueError("merged group exceeds num_groups_total")
+
+    @property
+    def consumed(self) -> int:
+        return self.last_group_id - self.group_id + 1
+
+    @property
+    def includes_final(self) -> bool:
+        return self.last_group_id + 1 == self.num_groups_total
+
+    @property
+    def layer_range(self) -> LayerGroupRange:
+        return LayerGroupRange(self.group_id, self.start, self.end)
+
+
+@dataclass(frozen=True)
 class LayeredPrefillConfig:
     """Configuration for the eager layered-prefill reference path.
 
@@ -53,10 +92,31 @@ class LayeredPrefillConfig:
     max_groups_per_step: int = 1
     require_pd_mixed: bool = True
     require_eager: bool = True
+    # PP=1 PoC: keep D+P in one eager layer-group forward. Decode rows that
+    # join at group 0 ride every remaining group; they sample only on the
+    # last group. Default off — serial D→P is unchanged. PP>1 ignores this.
+    fuse_mixed_batch: bool = False
+    # Same-layer mix, D finishes the round: P advances one group; D runs
+    # [0, group) alone, batches with P on that group, then finishes
+    # [group_end, L) and samples. Pure D keeps the FULL decode graph.
+    # Mutually exclusive with fuse_mixed_batch. PP>1 ignored (serial).
+    same_layer_batch: bool = False
+    # Soft cap on a P group while decode is present, in milliseconds.
+    # 0 = unlimited. Not a hard realtime guarantee.
+    p_group_decode_budget_ms: float = 0.0
 
     def __post_init__(self) -> None:
         groups = tuple(sorted(set(int(v) for v in self.allowed_num_groups)))
         object.__setattr__(self, "allowed_num_groups", groups)
+        if self.fuse_mixed_batch and self.same_layer_batch:
+            raise ValueError(
+                "layered_prefill_config: fuse_mixed_batch and "
+                "same_layer_batch are mutually exclusive"
+            )
+        if self.p_group_decode_budget_ms < 0:
+            raise ValueError(
+                "layered_prefill_config.p_group_decode_budget_ms must be >= 0"
+            )
         if self.mode not in ("one_group", "adaptive"):
             raise ValueError(
                 "layered_prefill_config.mode must be 'one_group' or 'adaptive'"
@@ -83,9 +143,21 @@ class LayeredPrefillConfig:
     def from_vllm_config(cls, vllm_config: Any) -> "LayeredPrefillConfig":
         additional_config = getattr(vllm_config, "additional_config", None) or {}
         if not isinstance(additional_config, dict):
+            if additional_config:
+                logger.warning(
+                    "LayeredPrefillConfig: additional_config is %s, not dict; "
+                    "layered stays disabled",
+                    type(additional_config).__name__,
+                )
             return cls()
         scheduler_config = additional_config.get("scheduler_config", {})
         if not isinstance(scheduler_config, dict):
+            if scheduler_config:
+                logger.warning(
+                    "LayeredPrefillConfig: scheduler_config is %s, not dict; "
+                    "layered stays disabled",
+                    type(scheduler_config).__name__,
+                )
             return cls()
         raw = scheduler_config.get("layered_prefill_config", {})
         if raw is None:
@@ -110,6 +182,11 @@ class LayeredPrefillConfig:
             max_groups_per_step=int(raw.get("max_groups_per_step", 1)),
             require_pd_mixed=bool(raw.get("require_pd_mixed", True)),
             require_eager=bool(raw.get("require_eager", True)),
+            fuse_mixed_batch=bool(raw.get("fuse_mixed_batch", False)),
+            same_layer_batch=bool(raw.get("same_layer_batch", False)),
+            p_group_decode_budget_ms=float(
+                raw.get("p_group_decode_budget_ms", 0.0) or 0.0
+            ),
         )
 
 
@@ -229,6 +306,73 @@ def make_pp_aligned_layer_group_ranges(
     return tuple(ranges)
 
 
+def _pp_stage_owner(
+    start: int,
+    end: int,
+    pipeline_parallel_size: int,
+    num_hidden_layers: int,
+) -> int | None:
+    """Return the unique PP rank that owns ``[start, end)``, or None if split."""
+
+    if pipeline_parallel_size <= 1:
+        return 0
+    from vllm.distributed.utils import get_pp_indices
+
+    for rank in range(pipeline_parallel_size):
+        stage_start, stage_end = get_pp_indices(
+            num_hidden_layers, rank, pipeline_parallel_size
+        )
+        if stage_start <= start and end <= stage_end:
+            return rank
+    return None
+
+
+def merge_consecutive_layer_groups(
+    ranges: Sequence[LayerGroupRange],
+    group_id: int,
+    max_groups: int,
+    *,
+    pipeline_parallel_size: int = 1,
+    num_hidden_layers: int | None = None,
+) -> MergedLayerGroup:
+    """Fuse up to ``max_groups`` contiguous groups into one P layer range.
+
+    Stops before a PP stage boundary so the activation-frontier owner stays
+    unique.  ``max_groups=1`` is a no-op wrap of ``ranges[group_id]``.
+    """
+
+    if max_groups < 1:
+        raise ValueError("max_groups must be >= 1")
+    if not ranges:
+        raise ValueError("ranges must be non-empty")
+    if not 0 <= group_id < len(ranges):
+        raise ValueError("group_id out of range")
+    layers = int(num_hidden_layers if num_hidden_layers is not None else ranges[-1].end)
+    first = ranges[group_id]
+    owner = _pp_stage_owner(
+        first.start, first.end, pipeline_parallel_size, layers
+    )
+    last_id = group_id
+    end = first.end
+    for nxt in ranges[group_id + 1 : group_id + max_groups]:
+        if nxt.start != end:
+            break
+        nxt_owner = _pp_stage_owner(
+            nxt.start, nxt.end, pipeline_parallel_size, layers
+        )
+        if owner is None or nxt_owner != owner:
+            break
+        end = nxt.end
+        last_id = nxt.group_id
+    return MergedLayerGroup(
+        group_id=first.group_id,
+        last_group_id=last_id,
+        start=first.start,
+        end=end,
+        num_groups_total=len(ranges),
+    )
+
+
 def select_num_groups(
     prompt_tokens: int,
     num_hidden_layers: int,
@@ -277,6 +421,7 @@ class LayeredPrefillPlan:
     commit_tokens: Mapping[str, int]
     reuse_kv_blocks: bool = True
     is_final_chunk: bool = True
+    cached_tokens: Mapping[str, int] | None = None
 
     def __post_init__(self) -> None:
         if self.version != 1:
@@ -294,9 +439,14 @@ class LayeredPrefillPlan:
         commit_tokens = {
             req_id: int(value) for req_id, value in self.commit_tokens.items()
         }
+        cached_tokens = {
+            req_id: int((self.cached_tokens or {}).get(req_id, 0))
+            for req_id in req_ids
+        }
         object.__setattr__(self, "prefill_req_ids", req_ids)
         object.__setattr__(self, "query_tokens", query_tokens)
         object.__setattr__(self, "commit_tokens", commit_tokens)
+        object.__setattr__(self, "cached_tokens", cached_tokens)
         if not req_ids:
             raise ValueError("a layered prefill plan must contain a request")
         if len(req_ids) != len(set(req_ids)):
@@ -400,6 +550,25 @@ class LayeredPrefillPolicy:
             getattr(scheduler_config, "max_num_batched_tokens", 0) or 0
         )
         self._next_cohort_id = 0
+        logger.info(
+            "Layered prefill policy enabled=%s mode=%s require_pd_mixed=%s "
+            "require_eager=%s allowed_num_groups=%s group_token_target=%s "
+            "fuse_mixed_batch=%s same_layer_batch=%s "
+            "p_group_decode_budget_ms=%s pp=%s layers=%s "
+            "additional_config_is_dict=%s",
+            self.config.enabled,
+            self.config.mode,
+            self.config.require_pd_mixed,
+            self.config.require_eager,
+            self.config.allowed_num_groups,
+            self.config.group_token_target,
+            self.config.fuse_mixed_batch,
+            self.config.same_layer_batch,
+            self.config.p_group_decode_budget_ms,
+            self.pipeline_parallel_size,
+            self.num_hidden_layers,
+            isinstance(getattr(vllm_config, "additional_config", None), dict),
+        )
 
     @property
     def enabled(self) -> bool:
@@ -456,6 +625,7 @@ class LayeredPrefillPolicy:
         # worker pads the physical batch for sequence-sharded execution,
         # while scheduler bookkeeping and KV commit cover the whole chunk.
         request.layered_prefill_query_tokens = query_tokens
+        request.layered_prefill_cached_tokens = chunk_start
 
     def make_plan(self, request: Any) -> LayeredPrefillPlan:
         if not getattr(request, "layered_prefill_enabled", False):
@@ -493,6 +663,11 @@ class LayeredPrefillPolicy:
                 request.num_computed_tokens + query_tokens
                 >= request.num_prompt_tokens
             ),
+            cached_tokens={
+                request.request_id: int(
+                    getattr(request, "layered_prefill_cached_tokens", 0) or 0
+                )
+            },
         )
 
 
@@ -505,3 +680,8 @@ def reset_layered_prefill_request(request: Any) -> None:
     request.layered_prefill_num_groups = 0
     request.layered_prefill_query_tokens = 0
     request.layered_prefill_kv_reserved = False
+    request.layered_prefill_cached_tokens = 0
+    request.layered_fused_decode_ids = None
+    request.layered_fused_decode_owner = None
+    request.layered_fused_resume_group = 0
+    request.layered_fused_num_groups = 0

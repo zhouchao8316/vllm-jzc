@@ -182,6 +182,18 @@ class Request:
         self.layered_prefill_num_groups = 0
         self.layered_prefill_query_tokens = 0
         self.layered_prefill_kv_reserved = False
+        # Prefix-cache hits already have KV in every layer.  Layered groups
+        # only replay the uncached suffix, starting at this cursor.
+        self.layered_prefill_cached_tokens = 0
+        # fuse_mixed_batch: P request records D riders that joined at group 0.
+        # Each rider sets layered_fused_decode_slot after the one-time KV alloc.
+        # resume_group is the next layer group that rider must run. It is not
+        # a fresh layer-0 decode while the slot is still held.
+        self.layered_fused_decode_ids: list[str] | None = None
+        self.layered_fused_decode_slot = False
+        self.layered_fused_decode_owner: str | None = None
+        self.layered_fused_resume_group = 0
+        self.layered_fused_num_groups = 0
 
         # Multi-modal related
         self.mm_features = mm_features or []

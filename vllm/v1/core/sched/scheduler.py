@@ -40,7 +40,9 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.layered_prefill import (
+    LayeredPrefillPlan,
     LayeredPrefillPolicy,
+    make_pp_aligned_layer_group_ranges,
     reset_layered_prefill_request,
 )
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
@@ -89,6 +91,16 @@ class Scheduler(SchedulerInterface):
         self.scheduler_config = vllm_config.scheduler_config
         self.layered_prefill_policy = LayeredPrefillPolicy(vllm_config)
         self._hold_layered_prefills = False
+        self._hold_fused_mixed_decodes = False
+        # Set while a fused admission miss reschedules ready decodes.
+        # In-flight riders must not be restarted as layer-0 FULL decodes.
+        self._skip_inflight_fused_riders = False
+        self._defer_running_for_rider_resume = False
+        # KV reserved for a new fused P before the held decode pass. None
+        # unless that reservation succeeded and still has to be published.
+        self._pending_layered_admission: tuple[Any, ...] | None = None
+        self._layered_fallback_counts: dict[str, int] = {}
+        self._logged_layered_no_candidate_detail = False
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
         self.kv_cache_config = kv_cache_config
@@ -463,17 +475,56 @@ class Scheduler(SchedulerInterface):
         """
         candidate = self._get_layered_prefill_candidate()
         if candidate is None:
+            if self._fuse_mixed_batch_active():
+                orphan = self._next_orphaned_fused_rider()
+                if orphan is not None:
+                    return self._schedule_fused_rider_continuation(
+                        orphan, throttle_prefills
+                    )
+            self._log_layered_fallback("no_candidate")
+            # An in-flight layer group (async) or a just-scheduled final group
+            # (sample not back yet) must not fall through to unheld regular
+            # admission: that steals waiting prompts as full prefills and
+            # drops the P+D mix the PP smoke gate looks for.
+            if (
+                self._has_in_flight_layered_prefill()
+                or self._has_unsampled_final_prefill()
+            ):
+                return self._schedule_regular_holding_prefills(throttle_prefills)
             return self._schedule_regular(throttle_prefills)
 
         if self._pause_state != PauseState.UNPAUSED:
+            self._log_layered_fallback("paused")
             self._reset_or_preempt_layered_request(candidate)
             return self._schedule_regular(throttle_prefills)
 
         if not self._layered_prefill_supported_for_scheduler():
             # Fail closed: an unsupported configuration must not leave a
             # request marked layered while the regular scheduler skips it.
+            self._log_layered_fallback("unsupported_scheduler")
             self._reset_or_preempt_layered_request(candidate)
             return self._schedule_regular(throttle_prefills)
+
+        prefix_blocks = self.kv_cache_manager.empty_kv_cache_blocks
+        prefix_hits = 0
+        if (
+            getattr(self.cache_config, "enable_prefix_caching", False)
+            and candidate.status
+            in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+            and candidate.num_computed_tokens == 0
+            and candidate.layered_prefill_group_id == 0
+        ):
+            prefix_blocks, prefix_hits, _ = self.kv_cache_manager.get_computed_blocks(
+                candidate
+            )
+            self.kv_cache_manager.record_prefix_cache_stats(candidate, prefix_hits)
+            if prefix_hits > 0 and prefix_hits >= candidate.num_prompt_tokens - 1:
+                # All-but-last-token hit: the regular path samples from cache.
+                self._log_layered_fallback("prefix_full_hit")
+                self._reset_or_preempt_layered_request(candidate)
+                return self._schedule_regular(throttle_prefills)
+            if prefix_hits > 0:
+                self._apply_layered_prefix_hit(candidate, prefix_hits)
 
         query_tokens = candidate.layered_prefill_query_tokens
         if query_tokens <= 0 or query_tokens > self.max_num_scheduled_tokens:
@@ -482,6 +533,7 @@ class Scheduler(SchedulerInterface):
                 "falling back to regular scheduling.",
                 candidate.request_id,
             )
+            self._log_layered_fallback("query_budget")
             self._reset_or_preempt_layered_request(candidate)
             return self._schedule_regular(throttle_prefills)
 
@@ -496,6 +548,7 @@ class Scheduler(SchedulerInterface):
             and candidate.num_computed_tokens == 0
             and not self._has_layered_decode_work(candidate)
         ):
+            self._log_layered_fallback("require_pd_mixed")
             self._reset_or_preempt_layered_request(candidate)
             return self._schedule_regular(throttle_prefills)
 
@@ -505,7 +558,23 @@ class Scheduler(SchedulerInterface):
             RequestStatus.PREEMPTED,
         )
         request_is_new = admission_status == RequestStatus.WAITING
-        if request_needs_admission:
+        if request_needs_admission and self._fuse_mixed_batch_active():
+            # Decide admission before holding decodes. A miss must not return
+            # the held schedule: that schedule skipped every ready decode.
+            self._remove_layered_candidate_from_waiting(candidate)
+            if len(self.running) >= self.max_num_running_reqs:
+                self._log_layered_fallback("max_running")
+                self._requeue_layered_candidate(candidate, admission_status)
+                return self._schedule_after_fused_admission_failed(throttle_prefills)
+            reservation = self._try_reserve_layered_kv(candidate)
+            if reservation is None:
+                self._log_layered_fallback("kv_alloc_failed")
+                if candidate.layered_prefill_group_id == 0:
+                    reset_layered_prefill_request(candidate)
+                self._requeue_layered_candidate(candidate, admission_status)
+                return self._schedule_after_fused_admission_failed(throttle_prefills)
+            self._pending_layered_admission = reservation
+        elif request_needs_admission:
             # Keep the candidate out of the regular waiting traversal while it
             # admits Decode requests.  It is requeued if the reservation fails.
             self._remove_layered_candidate_from_waiting(candidate)
@@ -513,10 +582,12 @@ class Scheduler(SchedulerInterface):
         old_max_tokens = self.max_num_scheduled_tokens
         self.max_num_scheduled_tokens = old_max_tokens - query_tokens
         self._hold_layered_prefills = True
+        self._hold_fused_mixed_decodes = self._fuse_mixed_batch_active()
         try:
             scheduler_output = self._schedule_regular(throttle_prefills)
         finally:
             self._hold_layered_prefills = False
+            self._hold_fused_mixed_decodes = False
             self.max_num_scheduled_tokens = old_max_tokens
 
         if not request_needs_admission and (
@@ -526,6 +597,7 @@ class Scheduler(SchedulerInterface):
             # The regular admission path may have preempted this request to
             # make room for a higher-priority Decode request.  Its preemption
             # handler already reset the frontier metadata and requeued it.
+            self._log_layered_fallback("preempted_during_decode_admission")
             return scheduler_output
 
         # A running request already owns its prompt blocks.  A newly admitted
@@ -533,33 +605,60 @@ class Scheduler(SchedulerInterface):
         # once; every later group reuses the reservation.
         if request_needs_admission:
             if len(self.running) >= self.max_num_running_reqs:
+                self._log_layered_fallback("max_running")
+                if self._pending_layered_admission is not None:
+                    self.kv_cache_manager.free(candidate)
+                    self._pending_layered_admission = None
+                    self._requeue_layered_candidate(candidate, admission_status)
+                    return self._unwind_held_schedule_and_run_decodes(
+                        scheduler_output, throttle_prefills
+                    )
                 self._requeue_layered_candidate(candidate, admission_status)
                 return scheduler_output
-            # Prefix-cache lookup mirrors the regular waiting path.  Cached
-            # blocks are complete for every layer once the producing request
-            # finished its cohort, so layered requests may reuse them.
-            num_computed_tokens = candidate.num_computed_tokens
-            new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
-            if num_computed_tokens == 0:
+            if self._pending_layered_admission is not None:
                 (
-                    new_computed_blocks,
+                    new_blocks,
                     num_computed_tokens,
-                    candidate.shared_prefix_boundary,
-                ) = self.kv_cache_manager.get_computed_blocks(candidate)
-            new_blocks = self.kv_cache_manager.allocate_slots(
-                candidate,
-                candidate.num_prompt_tokens - num_computed_tokens,
-                num_new_computed_tokens=num_computed_tokens,
-                new_computed_blocks=new_computed_blocks,
-                num_lookahead_tokens=0,
-                delay_cache_blocks=True,
-                has_scheduled_reqs=bool(self.running),
-            )
-            if new_blocks is None:
-                if candidate.layered_prefill_group_id == 0:
-                    reset_layered_prefill_request(candidate)
-                self._requeue_layered_candidate(candidate, admission_status)
-                return scheduler_output
+                    layered_zero_ids,
+                    extra_copies,
+                    extra_retained,
+                ) = self._pending_layered_admission
+                self._pending_layered_admission = None
+            else:
+                # Prefix-cache lookup mirrors the regular waiting path.  Cached
+                # blocks are complete for every layer once the producing request
+                # finished its cohort, so layered requests may reuse them.
+                num_computed_tokens = candidate.num_computed_tokens
+                new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
+                if num_computed_tokens == 0:
+                    (
+                        new_computed_blocks,
+                        num_computed_tokens,
+                        candidate.shared_prefix_boundary,
+                    ) = self.kv_cache_manager.get_computed_blocks(candidate)
+                new_blocks = self.kv_cache_manager.allocate_slots(
+                    candidate,
+                    candidate.num_prompt_tokens - num_computed_tokens,
+                    num_new_computed_tokens=num_computed_tokens,
+                    new_computed_blocks=new_computed_blocks,
+                    num_lookahead_tokens=0,
+                    delay_cache_blocks=True,
+                    has_scheduled_reqs=bool(self.running),
+                )
+                if new_blocks is None:
+                    self._log_layered_fallback("kv_alloc_failed")
+                    if candidate.layered_prefill_group_id == 0:
+                        reset_layered_prefill_request(candidate)
+                    self._requeue_layered_candidate(candidate, admission_status)
+                    if self._fuse_mixed_batch_active():
+                        return self._unwind_held_schedule_and_run_decodes(
+                            scheduler_output, throttle_prefills
+                        )
+                    return scheduler_output
+                layered_zero_ids = self._get_new_block_ids_to_zero()
+                extra_copies, extra_retained = (
+                    self.kv_cache_manager.take_kv_cache_block_copies()
+                )
             if num_computed_tokens != candidate.num_computed_tokens:
                 candidate.num_computed_tokens = num_computed_tokens
                 # Re-plan the first chunk from the cache-hit position so
@@ -571,21 +670,36 @@ class Scheduler(SchedulerInterface):
             candidate.status = RequestStatus.RUNNING
             self.running.append(candidate)
             self._inflight_prefills.add(candidate)
-            layered_zero_ids = self._get_new_block_ids_to_zero()
             if layered_zero_ids:
                 existing_zero_ids = scheduler_output.new_block_ids_to_zero or []
                 scheduler_output.new_block_ids_to_zero = (
                     existing_zero_ids + layered_zero_ids
                 )
-            if request_is_new:
+            # allocate_slots ran after _schedule_regular already drained
+            # CoW copies.  A partial prefix hit must still reach the worker
+            # on this step. Copies were taken with the reservation above.
+            if extra_copies:
+                existing_copies = scheduler_output.kv_cache_block_copies or []
+                scheduler_output.kv_cache_block_copies = (
+                    existing_copies + extra_copies
+                )
+                self._free_cow_retained_blocks(
+                    extra_retained, self.sched_step_seq + 1
+                )
+            # Prefix+suffix, not allocate_slots' new suffix alone.
+            assigned_blocks = self.kv_cache_manager.get_blocks(
+                candidate.request_id
+            )
+            # V2 finish_requests drops preempted ids, so resume must re-enter
+            # through NewRequestData (regular path: scheduled_new_reqs.extend(
+            # scheduled_resumed_reqs)).  V1 keeps the request and replaces
+            # the block table via CachedRequestData.
+            emit_as_new = request_is_new or self.use_v2_model_runner
+            if emit_as_new:
                 scheduler_output.scheduled_new_reqs.append(
                     NewRequestData.from_request(
                         candidate,
-                        self.kv_cache_manager.get_blocks(
-                            candidate.request_id
-                        ).get_block_ids(),
-                        # Model Runner V2 requires prefill_token_ids on new
-                        # requests (see regular schedule path below).
+                        assigned_blocks.get_block_ids(),
                         candidate._all_token_ids
                         if self.use_v2_model_runner
                         else None,
@@ -597,13 +711,7 @@ class Scheduler(SchedulerInterface):
                     [candidate],
                     {candidate.request_id: query_tokens},
                     {},
-                    # A resumed request must reinstall every block it owns,
-                    # including prefix-cache hits excluded from new_blocks.
-                    {
-                        candidate.request_id: self.kv_cache_manager.get_blocks(
-                            candidate.request_id
-                        )
-                    },
+                    {candidate.request_id: assigned_blocks},
                 )
                 self._append_cached_request_data(
                     scheduler_output.scheduled_cached_reqs, cached
@@ -632,14 +740,11 @@ class Scheduler(SchedulerInterface):
                 scheduler_output.scheduled_cached_reqs, cached
             )
 
-        # The worker must replay the chunk positions
-        # [chunk_start, chunk_start + query_tokens) for every layer group.
-        # Keep the scheduler's logical token count (which is committed only
-        # by the final group) separate from the worker input cursor,
-        # otherwise the final group would start at the committed position
-        # and either read output-token slots or write duplicate KV entries.
-        if not request_is_new:
-            cached_req_ids = scheduler_output.scheduled_cached_reqs.req_ids
+        # Replay chunk positions [chunk_start, chunk_start + query) through
+        # every layer group.  NewRequestData already copied num_computed_tokens
+        # (V2 resume included).  Only CachedRequestData needs a cursor write.
+        cached_req_ids = scheduler_output.scheduled_cached_reqs.req_ids
+        if req_id in cached_req_ids:
             cached_index = cached_req_ids.index(req_id)
             scheduler_output.scheduled_cached_reqs.num_computed_tokens[
                 cached_index
@@ -662,9 +767,98 @@ class Scheduler(SchedulerInterface):
                 plan.commit_tokens[req_id],
                 plan.is_final_chunk,
             )
+        self._attach_running_decodes_to_layered_output(scheduler_output, candidate)
         self._update_after_layered_schedule(candidate, scheduler_output)
         self.prev_step_scheduled_req_ids.add(req_id)
+        other_ids = [
+            other_id
+            for other_id in scheduler_output.num_scheduled_tokens
+            if other_id != req_id
+        ]
+        logger.info(
+            "Layered prefill scheduled: group=%s/%s layers=[%s,%s) "
+            "req=%s query=%s commit=%s other_scheduled=%s fused_mixed=%s "
+            "fused_riders=%s",
+            plan.group_id,
+            plan.num_groups,
+            plan.group_start,
+            plan.group_end,
+            req_id,
+            query_tokens,
+            plan.commit_tokens.get(req_id),
+            other_ids,
+            self._fuse_mixed_batch_active(),
+            getattr(candidate, "layered_fused_decode_ids", None),
+        )
         return scheduler_output
+
+    def _log_layered_fallback(self, reason: str) -> None:
+        """Record why a layered step fell back to the regular scheduler.
+
+        ``info_once`` is keyed by ``reason`` so each cause prints once; the
+        first ``no_candidate`` also dumps waiting-queue eligibility.
+        """
+        self._layered_fallback_counts[reason] = (
+            self._layered_fallback_counts.get(reason, 0) + 1
+        )
+        logger.info_once("Layered prefill fallback to regular scheduling: %s", reason)
+        if (
+            reason == "no_candidate"
+            and not self._logged_layered_no_candidate_detail
+            and (self.waiting or self.skipped_waiting)
+        ):
+            self._logged_layered_no_candidate_detail = True
+            samples = []
+            for request in list(self.waiting)[:4]:
+                sampling_params = request.sampling_params
+                samples.append(
+                    {
+                        "status": str(request.status),
+                        "prompt_tokens": request.num_prompt_tokens,
+                        "computed": request.num_computed_tokens,
+                        "outputs": len(request.output_token_ids or []),
+                        "eligible": self._is_layered_request_eligible(request),
+                        "enabled": bool(
+                            getattr(request, "layered_prefill_enabled", False)
+                        ),
+                        "group_id": getattr(
+                            request, "layered_prefill_group_id", None
+                        ),
+                        "num_groups": getattr(
+                            request, "layered_prefill_num_groups", None
+                        ),
+                        "logprobs": None
+                        if sampling_params is None
+                        else sampling_params.logprobs,
+                        "structured": bool(request.use_structured_output),
+                    }
+                )
+            logger.info(
+                "Layered prefill no-candidate detail: waiting=%s running=%s "
+                "supported=%s head=%s",
+                len(self.waiting) + len(self.skipped_waiting),
+                len(self.running),
+                self._layered_prefill_supported_for_scheduler(),
+                samples,
+            )
+        if reason == "unsupported_scheduler":
+            parallel_config = self.parallel_config
+            cache_config = self.cache_config
+            layered_config = self.layered_prefill_policy.config
+            logger.info(
+                "Layered prefill unsupported: pp=%s async=%s dbo=%s "
+                "require_eager=%s enforce_eager=%s connector=%s pc=%s kv_xfer=%s",
+                parallel_config.pipeline_parallel_size,
+                self.scheduler_config.async_scheduling,
+                bool(getattr(parallel_config, "enable_dbo", False)),
+                layered_config.require_eager,
+                bool(
+                    getattr(self.vllm_config.model_config, "enforce_eager", False)
+                ),
+                self.connector is not None,
+                bool(getattr(cache_config, "enable_prefix_caching", False)),
+                self.vllm_config.kv_transfer_config is not None,
+            )
 
     def _remove_layered_candidate_from_waiting(self, request: Request) -> None:
         for queue in (self.waiting, self.skipped_waiting):
@@ -690,12 +884,24 @@ class Scheduler(SchedulerInterface):
             reset_layered_prefill_request(request)
 
     def _get_layered_prefill_candidate(self) -> Request | None:
+        in_flight_layered = False
         for request in self.running:
             if (
                 self._is_layered_prefill_pending(request)
                 and self._is_layered_request_eligible(request)
             ):
+                if request.num_in_flight_tokens > 0:
+                    # Previous layer group is still on the worker.  Do not
+                    # pipeline the next group: that consumes Decode tokens
+                    # on an intermediate step and leaves the final group
+                    # P-only (pd_mix_dp_slot needs D ∪ final-P).
+                    in_flight_layered = True
+                    continue
                 return request
+        if in_flight_layered:
+            return None
+        if self._has_unsampled_final_prefill():
+            return None
         # Decode requests and unsupported request types can be ahead of a
         # prompt in either FCFS or priority queues.  Walk the queue rather
         # than looking only at its head so a Decode row can share the step
@@ -721,6 +927,462 @@ class Scheduler(SchedulerInterface):
             and request.num_computed_tokens == 0
             and not request.output_token_ids
         )
+
+    def _schedule_regular_holding_prefills(
+        self, throttle_prefills: bool = False
+    ) -> SchedulerOutput:
+        self._hold_layered_prefills = True
+        self._hold_fused_mixed_decodes = self._fuse_mixed_batch_active()
+        try:
+            return self._schedule_regular(throttle_prefills)
+        finally:
+            self._hold_layered_prefills = False
+            self._hold_fused_mixed_decodes = False
+
+    def _has_in_flight_layered_prefill(self) -> bool:
+        for request in self.running:
+            if (
+                self._is_layered_prefill_pending(request)
+                and self._is_layered_request_eligible(request)
+                and request.num_in_flight_tokens > 0
+            ):
+                return True
+        return False
+
+    def _has_unsampled_final_prefill(self) -> bool:
+        """True while a prompt's last scheduled tokens are still on the worker.
+
+        The request already committed its prompt cursor, so regular Decode
+        sees ``num_new_tokens==0`` until the first sampled token lands.
+        Starting another layered P in that window cannot produce a mixed
+        P+D step.
+        """
+        for request in self.running:
+            if (
+                request.num_in_flight_tokens > 0
+                and not request.output_token_ids
+                and request.num_prompt_tokens > 0
+                and request.num_computed_tokens >= request.num_prompt_tokens
+            ):
+                return True
+        return False
+
+    def _fuse_mixed_batch_active(self) -> bool:
+        """Fused mixed: one eager layer-group forward for D+P together."""
+        return bool(self.layered_prefill_policy.config.fuse_mixed_batch)
+
+    @staticmethod
+    def _clear_fused_rider_state(request: Request) -> None:
+        request.layered_fused_decode_slot = False
+        request.layered_fused_decode_owner = None
+        request.layered_fused_resume_group = 0
+        request.layered_fused_num_groups = 0
+
+    def _try_reserve_layered_kv(self, candidate: Request):
+        """Reserve a new layered prompt's KV without publishing the request.
+
+        Returns None when the blocks do not fit. Nothing is allocated in that
+        case, so the caller can requeue the prompt and schedule decodes.
+        """
+        num_computed_tokens = candidate.num_computed_tokens
+        new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
+        if num_computed_tokens == 0:
+            (
+                new_computed_blocks,
+                num_computed_tokens,
+                candidate.shared_prefix_boundary,
+            ) = self.kv_cache_manager.get_computed_blocks(candidate)
+        new_blocks = self.kv_cache_manager.allocate_slots(
+            candidate,
+            candidate.num_prompt_tokens - num_computed_tokens,
+            num_new_computed_tokens=num_computed_tokens,
+            new_computed_blocks=new_computed_blocks,
+            num_lookahead_tokens=0,
+            delay_cache_blocks=True,
+            has_scheduled_reqs=bool(self.running),
+        )
+        if new_blocks is None:
+            return None
+        # Drain now. The following held decode pass also drains, and a second
+        # take would drop these ids.
+        zero_ids = self._get_new_block_ids_to_zero()
+        extra_copies, extra_retained = (
+            self.kv_cache_manager.take_kv_cache_block_copies()
+        )
+        return (
+            new_blocks,
+            num_computed_tokens,
+            zero_ids,
+            extra_copies,
+            extra_retained,
+        )
+
+    def _fused_rider_owner_still_active(self, request: Request) -> bool:
+        owner_id = getattr(request, "layered_fused_decode_owner", None)
+        if not owner_id:
+            return False
+        owner = self.requests.get(owner_id)
+        if owner is None or owner not in self.running:
+            return False
+        return bool(
+            self._is_layered_prefill_pending(owner)
+            and self._is_layered_request_eligible(owner)
+        )
+
+    def _next_orphaned_fused_rider(self) -> Request | None:
+        """A decode that has already run some fused groups and lost its P.
+
+        Its owner is no longer a live layered cohort, so the next step has
+        to finish the remaining groups. Restarting it at layer 0 is wrong.
+        """
+        for request in self.running:
+            if not getattr(request, "layered_fused_decode_slot", False):
+                continue
+            if request.num_in_flight_tokens > 0:
+                continue
+            resume_group = int(getattr(request, "layered_fused_resume_group", 0) or 0)
+            num_groups = int(getattr(request, "layered_fused_num_groups", 0) or 0)
+            if num_groups <= 0 or resume_group >= num_groups:
+                continue
+            if self._fused_rider_owner_still_active(request):
+                continue
+            return request
+        return None
+
+    def _schedule_after_fused_admission_failed(
+        self, throttle_prefills: bool
+    ) -> SchedulerOutput:
+        """P was not admitted. Ready decodes still run.
+
+        Fusion is optional. Waiting layered prompts stay queued for a later
+        attempt. A rider that already passed earlier layer groups is resumed
+        at the next group instead of being scheduled as a new decode.
+        """
+        orphan = self._next_orphaned_fused_rider()
+        if orphan is not None:
+            return self._schedule_fused_rider_continuation(orphan, throttle_prefills)
+        self._hold_layered_prefills = True
+        self._skip_inflight_fused_riders = True
+        try:
+            return self._schedule_regular(throttle_prefills)
+        finally:
+            self._hold_layered_prefills = False
+            self._skip_inflight_fused_riders = False
+
+    def _unwind_held_schedule_and_run_decodes(
+        self, held: SchedulerOutput, throttle_prefills: bool
+    ) -> SchedulerOutput:
+        """Drop a fused hold-pass and schedule decodes through the normal path.
+
+        The hold-pass already committed token cursors and drained one-shot
+        ids. Put those back before the replacement schedule accounts again.
+        """
+        for req_id, num_tokens in held.num_scheduled_tokens.items():
+            request = self.requests.get(req_id)
+            if request is None:
+                continue
+            request.num_computed_tokens -= num_tokens
+            request.num_in_flight_tokens -= num_tokens
+            if request.num_computed_tokens < 0 or request.num_in_flight_tokens < 0:
+                raise RuntimeError(
+                    "Cannot unwind fused hold-pass token accounting for "
+                    f"{req_id}: computed={request.num_computed_tokens} "
+                    f"in_flight={request.num_in_flight_tokens}"
+                )
+        if held.num_scheduled_tokens:
+            # The replacement schedule will allocate these tokens again.
+            # Free only requests whose whole KV was created by this pass
+            # (cursor rolled back to zero). Anything else still owns blocks
+            # from earlier steps; freeing those would drop live KV.
+            for req_id in held.num_scheduled_tokens:
+                request = self.requests.get(req_id)
+                if request is not None and request.num_computed_tokens == 0:
+                    self.kv_cache_manager.free(request)
+        self.finished_req_ids.update(held.finished_req_ids)
+        self.reset_preempted_req_ids.update(held.preempted_req_ids)
+        if held.free_encoder_mm_hashes:
+            self.encoder_cache_manager.freed.extend(list(held.free_encoder_mm_hashes))
+        if held.new_block_ids_to_zero:
+            for manager in self.kv_cache_manager.coordinator.single_type_managers:
+                if manager.records_new_block_ids:
+                    manager.new_block_ids.extend(held.new_block_ids_to_zero)
+                    break
+        self.current_step -= 1
+        return self._schedule_after_fused_admission_failed(throttle_prefills)
+
+    def _schedule_fused_rider_continuation(
+        self, rider: Request, throttle_prefills: bool
+    ) -> SchedulerOutput:
+        """Run the rider's next layer group. Do not mix in a fresh decode."""
+        self._hold_layered_prefills = True
+        self._defer_running_for_rider_resume = True
+        try:
+            scheduler_output = self._schedule_regular(throttle_prefills)
+        finally:
+            self._hold_layered_prefills = False
+            self._defer_running_for_rider_resume = False
+        if scheduler_output.num_scheduled_tokens:
+            raise RuntimeError(
+                "Fused rider resume scheduled other work into a mid-cohort step"
+            )
+        self._append_resumed_fused_rider(scheduler_output, rider)
+        return scheduler_output
+
+    def _append_resumed_fused_rider(
+        self, scheduler_output: SchedulerOutput, rider: Request
+    ) -> None:
+        resume_group = int(rider.layered_fused_resume_group)
+        num_groups = int(rider.layered_fused_num_groups)
+        ranges = make_pp_aligned_layer_group_ranges(
+            self.layered_prefill_policy.num_hidden_layers,
+            num_groups,
+            self.layered_prefill_policy.pipeline_parallel_size,
+        )
+        if resume_group >= len(ranges):
+            raise RuntimeError(
+                f"Fused rider {rider.request_id} resume group {resume_group} "
+                f"is outside {len(ranges)} groups"
+            )
+        layer_range = ranges[resume_group]
+        sampling = resume_group + 1 == num_groups
+        req_id = rider.request_id
+        num_new_tokens = 1
+        computed_before = int(rider.num_computed_tokens)
+        cached = self._make_cached_request_data(
+            [rider],
+            [],
+            {req_id: num_new_tokens},
+            {},
+            {req_id: self.kv_cache_manager.empty_kv_cache_blocks},
+        )
+        self._append_cached_request_data(scheduler_output.scheduled_cached_reqs, cached)
+        scheduler_output.num_scheduled_tokens[req_id] = num_new_tokens
+        scheduler_output.total_num_scheduled_tokens += num_new_tokens
+        rider.num_in_flight_tokens += num_new_tokens
+        rider.layered_fused_resume_group = resume_group + 1
+        if sampling:
+            rider.num_computed_tokens += num_new_tokens
+            rider.is_prefill_chunk = rider.num_computed_tokens < (
+                rider.num_tokens + rider.num_output_placeholders
+            )
+            self._clear_fused_rider_state(rider)
+        self.prev_step_scheduled_req_ids.add(req_id)
+        scheduler_output.layered_prefill_plan = LayeredPrefillPlan(
+            version=1,
+            cohort_id=max(int(getattr(rider, "layered_prefill_cohort_id", 0) or 0), 0),
+            group_id=resume_group,
+            num_groups=num_groups,
+            group_start=layer_range.start,
+            group_end=layer_range.end,
+            prefill_req_ids=(req_id,),
+            query_tokens={req_id: num_new_tokens},
+            commit_tokens={req_id: num_new_tokens if sampling else 0},
+            reuse_kv_blocks=True,
+            is_final_chunk=True,
+            cached_tokens={req_id: computed_before},
+        )
+
+    def _attach_running_decodes_to_layered_output(
+        self, scheduler_output: SchedulerOutput, candidate: Request
+    ) -> None:
+        """Add Decode rows that regular admission skipped but can run now.
+
+        Token budget was reserved for the P query before Decode admission, so
+        a one-token Decode can still fit after the P row is appended.
+
+        ``fuse_mixed_batch`` holds those D rows out of regular admission and
+        attaches them here without committing ``num_computed_tokens`` until
+        the sampling step, so the same decode token is replayed through every
+        layer group.
+        """
+        if self._fuse_mixed_batch_active():
+            self._attach_fused_mixed_decodes(scheduler_output, candidate)
+            return
+        remaining = (
+            self.max_num_scheduled_tokens - scheduler_output.total_num_scheduled_tokens
+        )
+        if remaining <= 0:
+            return
+        extra_copies: list[Any] = []
+        extra_retained: list[Any] = []
+        for request in self.running:
+            if remaining <= 0:
+                break
+            if request is candidate:
+                continue
+            req_id = request.request_id
+            if req_id in scheduler_output.num_scheduled_tokens:
+                continue
+            if self._is_layered_prefill_pending(request):
+                continue
+            if self.current_step < request.next_decode_eligible_step:
+                continue
+            if not self._is_layered_decode_request(request):
+                continue
+            num_new_tokens = (
+                request.num_tokens_with_spec
+                + request.num_output_placeholders
+                - request.num_computed_tokens
+            )
+            num_new_tokens = min(num_new_tokens, remaining)
+            num_new_tokens = min(
+                num_new_tokens,
+                self.max_model_len
+                - request.num_computed_tokens
+                - self.num_sampled_tokens_per_step,
+            )
+            if num_new_tokens <= 0:
+                continue
+            new_blocks = self.kv_cache_manager.allocate_slots(
+                request,
+                num_new_tokens,
+                num_lookahead_tokens=self.num_lookahead_tokens,
+            )
+            if new_blocks is None:
+                continue
+            copies, retained = self.kv_cache_manager.take_kv_cache_block_copies()
+            if copies:
+                extra_copies.extend(copies)
+                extra_retained.extend(retained)
+            cached = self._make_cached_request_data(
+                [request],
+                [],
+                {req_id: num_new_tokens},
+                {},
+                {req_id: new_blocks},
+            )
+            self._append_cached_request_data(
+                scheduler_output.scheduled_cached_reqs, cached
+            )
+            scheduler_output.num_scheduled_tokens[req_id] = num_new_tokens
+            scheduler_output.total_num_scheduled_tokens += num_new_tokens
+            request.num_computed_tokens += num_new_tokens
+            request.num_in_flight_tokens += num_new_tokens
+            request.is_prefill_chunk = request.num_computed_tokens < (
+                request.num_tokens + request.num_output_placeholders
+            )
+            self.prev_step_scheduled_req_ids.add(req_id)
+            remaining -= num_new_tokens
+        if extra_copies:
+            existing_copies = scheduler_output.kv_cache_block_copies or []
+            scheduler_output.kv_cache_block_copies = existing_copies + extra_copies
+            self._free_cow_retained_blocks(extra_retained, self.sched_step_seq + 1)
+
+    def _attach_fused_mixed_decodes(
+        self, scheduler_output: SchedulerOutput, candidate: Request
+    ) -> None:
+        """Ride decode rows with P through the same layer groups.
+
+        Token progress stays frozen until ``is_sampling_step``. Only D that
+        joined at this P's group 0 keep riding; a decode that arrives later
+        would skip early layers, so it waits.
+        """
+        plan = scheduler_output.layered_prefill_plan
+        assert plan is not None
+        sampling = bool(plan.is_sampling_step)
+        remaining = (
+            self.max_num_scheduled_tokens - scheduler_output.total_num_scheduled_tokens
+        )
+        if plan.group_id == 0:
+            riders: list[Request] = []
+            for request in self.running:
+                if remaining <= 0:
+                    break
+                if request is candidate:
+                    continue
+                if request.request_id in scheduler_output.num_scheduled_tokens:
+                    continue
+                if self._is_layered_prefill_pending(request):
+                    continue
+                if self.current_step < request.next_decode_eligible_step:
+                    continue
+                if not self._is_layered_decode_request(request):
+                    continue
+                if request.spec_token_ids:
+                    continue
+                riders.append(request)
+        else:
+            rider_ids = list(getattr(candidate, "layered_fused_decode_ids", None) or [])
+            riders = []
+            for req_id in rider_ids:
+                request = self.requests.get(req_id)
+                if request is None or request.is_finished():
+                    continue
+                if request not in self.running:
+                    continue
+                if req_id in scheduler_output.num_scheduled_tokens:
+                    continue
+                riders.append(request)
+
+        extra_copies: list[Any] = []
+        extra_retained: list[Any] = []
+        attached_ids: list[str] = []
+        for request in riders:
+            if remaining <= 0:
+                break
+            req_id = request.request_id
+            num_new_tokens = (
+                request.num_tokens_with_spec
+                + request.num_output_placeholders
+                - request.num_computed_tokens
+            )
+            num_new_tokens = min(num_new_tokens, remaining, 1)
+            num_new_tokens = min(
+                num_new_tokens,
+                self.max_model_len
+                - request.num_computed_tokens
+                - self.num_sampled_tokens_per_step,
+            )
+            if num_new_tokens <= 0:
+                continue
+            if not getattr(request, "layered_fused_decode_slot", False):
+                new_blocks = self.kv_cache_manager.allocate_slots(
+                    request,
+                    num_new_tokens,
+                    num_lookahead_tokens=self.num_lookahead_tokens,
+                )
+                if new_blocks is None:
+                    continue
+                request.layered_fused_decode_slot = True
+                copies, retained = self.kv_cache_manager.take_kv_cache_block_copies()
+                if copies:
+                    extra_copies.extend(copies)
+                    extra_retained.extend(retained)
+            else:
+                new_blocks = self.kv_cache_manager.empty_kv_cache_blocks
+            cached = self._make_cached_request_data(
+                [request],
+                [],
+                {req_id: num_new_tokens},
+                {},
+                {req_id: new_blocks},
+            )
+            self._append_cached_request_data(
+                scheduler_output.scheduled_cached_reqs, cached
+            )
+            scheduler_output.num_scheduled_tokens[req_id] = num_new_tokens
+            scheduler_output.total_num_scheduled_tokens += num_new_tokens
+            request.num_in_flight_tokens += num_new_tokens
+            request.layered_fused_decode_owner = candidate.request_id
+            request.layered_fused_resume_group = int(plan.group_id) + 1
+            request.layered_fused_num_groups = int(plan.num_groups)
+            if sampling:
+                request.num_computed_tokens += num_new_tokens
+                request.is_prefill_chunk = request.num_computed_tokens < (
+                    request.num_tokens + request.num_output_placeholders
+                )
+                self._clear_fused_rider_state(request)
+            self.prev_step_scheduled_req_ids.add(req_id)
+            remaining -= num_new_tokens
+            attached_ids.append(req_id)
+        if plan.group_id == 0:
+            candidate.layered_fused_decode_ids = attached_ids
+        if sampling:
+            candidate.layered_fused_decode_ids = None
+        if extra_copies:
+            existing_copies = scheduler_output.kv_cache_block_copies or []
+            scheduler_output.kv_cache_block_copies = existing_copies + extra_copies
+            self._free_cow_retained_blocks(extra_retained, self.sched_step_seq + 1)
 
     def _has_layered_decode_work(self, candidate: Request) -> bool:
         """Return whether another request can provide the D half of a step."""
@@ -755,7 +1417,7 @@ class Scheduler(SchedulerInterface):
     @staticmethod
     def _is_layered_request_eligible(request: Request) -> bool:
         sampling_params = request.sampling_params
-        return bool(
+        if not (
             request.status
             in (RequestStatus.WAITING, RequestStatus.PREEMPTED, RequestStatus.RUNNING)
             and request.pooling_params is None
@@ -767,6 +1429,28 @@ class Scheduler(SchedulerInterface):
             and sampling_params.prompt_logprobs is None
             and not sampling_params.logprob_token_ids
             and not request.use_structured_output
+        ):
+            return False
+        if getattr(request, "layered_prefill_enabled", False):
+            # Prefix-cache hits raise num_computed_tokens above 0 while the
+            # request is still a prompt.  Later groups keep that cursor.
+            return request.num_computed_tokens < request.num_prompt_tokens
+        return request.num_computed_tokens == 0
+
+    def _apply_layered_prefix_hit(self, candidate: Request, prefix_hits: int) -> None:
+        """Record a prefix-cache hit on a layered candidate.
+
+        V2 caps the first chunk through ``plan_chunk`` (MBT).  V1 keeps the
+        origin behaviour of exposing the full uncached remainder as query.
+        """
+        if prefix_hits <= 0:
+            return
+        if self.use_v2_model_runner:
+            self.layered_prefill_policy.plan_chunk(candidate, prefix_hits)
+            return
+        candidate.layered_prefill_cached_tokens = prefix_hits
+        candidate.layered_prefill_query_tokens = (
+            candidate.num_prompt_tokens - prefix_hits
         )
 
     @staticmethod
@@ -778,19 +1462,16 @@ class Scheduler(SchedulerInterface):
         )
 
     def _layered_prefill_supported_for_scheduler(self) -> bool:
-        # The layered policy is connector-free and synchronous.  Prefix
-        # caching is supported: admission reuses completed blocks and every
-        # finished chunk publishes its blocks to the cache.  TP ranks consume
-        # the same SchedulerOutput through the normal worker broadcast, so TP
-        # does not need a scheduler-side gate; DP=1 is enforced by the Ascend
-        # platform until plan synchronization across DP/EP ranks is
-        # implemented.  Model capability is checked by the worker.
+        # Connector / DBO / KV-transfer stay closed.  Prefix caching and
+        # chunked layered are supported on V1 after origin's Sep 14 work.
+        # Async scheduling still requires the V2 worker (serialized groups).
         parallel_config = self.parallel_config
         kv_transfer_config = self.vllm_config.kv_transfer_config
         layered_config = self.layered_prefill_policy.config
+        async_ok = self.use_v2_model_runner or not self.scheduler_config.async_scheduling
         return bool(
             parallel_config.pipeline_parallel_size >= 1
-            and not self.scheduler_config.async_scheduling
+            and async_ok
             and not getattr(parallel_config, "enable_dbo", False)
             and (
                 not layered_config.require_eager
@@ -843,7 +1524,40 @@ class Scheduler(SchedulerInterface):
                     request, request.num_computed_tokens
                 )
             else:
+                if self.scheduler_config.async_scheduling:
+                    # Final group samples the first decode token.  Match
+                    # AsyncScheduler placeholders so the next overlapping
+                    # schedule() does not double-schedule that position.
+                    request.num_output_placeholders += self.num_sampled_tokens_per_step
+                    if self.use_v2_model_runner:
+                        request.next_decode_eligible_step = (
+                            self.current_step + self.parallel_config.pipeline_parallel_size
+                        )
                 reset_layered_prefill_request(request)
+
+    def _cache_layered_prefill_blocks(
+        self, scheduler_output: SchedulerOutput
+    ) -> None:
+        """Hash KV after the final layer group actually wrote every layer.
+
+        allocate_slots uses delay_cache_blocks so intermediate groups cannot
+        publish a prefix that only exists in a subset of layers.
+
+        Must run before ``_free_request``: a max_tokens=1 / stop-on-first-token
+        finish deletes the request from ``self.requests`` and returns its
+        blocks.  Hashing afterwards is a no-op, so this prefill never becomes
+        a prefix hit for later requests.
+        """
+        if not getattr(self.cache_config, "enable_prefix_caching", False):
+            return
+        plan = getattr(scheduler_output, "layered_prefill_plan", None)
+        if plan is None or not plan.is_final_group:
+            return
+        for req_id in plan.prefill_req_ids:
+            request = self.requests.get(req_id)
+            if request is None or request.num_computed_tokens <= 0:
+                continue
+            self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
 
     def _schedule_regular(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
@@ -906,6 +1620,26 @@ class Scheduler(SchedulerInterface):
                 # reservation before handing it back to regular scheduling.
                 self.running.pop(req_index)
                 self._preempt_request(request, time.monotonic())
+                continue
+
+            if self._defer_running_for_rider_resume:
+                req_index += 1
+                continue
+
+            if (
+                self._hold_fused_mixed_decodes
+                and self._is_layered_decode_request(request)
+            ):
+                req_index += 1
+                continue
+
+            # A rider that already executed some fused groups must finish
+            # those layers. The FULL decode graph would start again at layer 0.
+            if (
+                self._skip_inflight_fused_riders
+                and getattr(request, "layered_fused_decode_slot", False)
+            ):
+                req_index += 1
                 continue
 
             if (
@@ -1727,6 +2461,8 @@ class Scheduler(SchedulerInterface):
         self._inflight_prefills.discard(request)
         if request.layered_prefill_enabled:
             reset_layered_prefill_request(request)
+        request.layered_fused_decode_ids = None
+        self._clear_fused_rider_state(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
         if request.spec_token_ids:
@@ -2167,6 +2903,10 @@ class Scheduler(SchedulerInterface):
             for rid in model_runner_output.req_ids:
                 routing_offsets[rid] = offset
                 offset += num_scheduled_tokens[rid]
+
+        # Hash delayed prefix-cache blocks while the request still owns them.
+        # The loop below may finish+free a max_tokens=1 request in this step.
+        self._cache_layered_prefill_blocks(scheduler_output)
 
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best

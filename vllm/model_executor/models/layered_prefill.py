@@ -153,6 +153,20 @@ class LayeredPrefillModelAdapter(ABC):
         )
 
         trace_layered = os.environ.get("VLLM_LAYERED_PREFILL_TRACE") == "1"
+        trace_rows = os.environ.get("VLLM_LAYERED_ROW_TRACE") == "1"
+        if trace_rows:
+            logger.info(
+                "layered_row adapter_in range=[%d,%d) hidden=%s residual=%s "
+                "input_ids=%s positions=%s frontier=%s",
+                layer_start,
+                layer_end,
+                tuple(hidden_states.shape),
+                None if residual is None else tuple(residual.shape),
+                None if input_ids is None else tuple(input_ids.shape),
+                tuple(positions.shape),
+                frontier is not None,
+            )
+        enter_rows = int(hidden_states.shape[0])
         if trace_layered:
             logger.info(
                 "Layered trace enter model=%s range=[%d,%d) tokens=%d "
@@ -179,6 +193,16 @@ class LayeredPrefillModelAdapter(ABC):
                 residual,
                 input_ids,
             )
+            if trace_rows and int(hidden_states.shape[0]) != enter_rows:
+                logger.info(
+                    "layered_row adapter_layer_row_change layer=%d "
+                    "hidden=%s residual=%s enter_rows=%d",
+                    global_idx,
+                    tuple(hidden_states.shape),
+                    None if residual is None else tuple(residual.shape),
+                    enter_rows,
+                )
+                enter_rows = int(hidden_states.shape[0])
             if trace_layered:
                 logger.info(
                     "Layered trace layer=%d hidden_sum=%.6e residual_sum=%s",
@@ -192,6 +216,16 @@ class LayeredPrefillModelAdapter(ABC):
         is_final_layer = layer_end == self.num_hidden_layers
         if is_final_layer and self.end_layer == self.num_hidden_layers:
             hidden_states, residual = self._finalize(hidden_states, residual)
+        if trace_rows:
+            logger.info(
+                "layered_row adapter_out range=[%d,%d) hidden=%s residual=%s "
+                "final=%s",
+                layer_start,
+                layer_end,
+                tuple(hidden_states.shape),
+                None if residual is None else tuple(residual.shape),
+                is_final_layer,
+            )
         return LayeredForwardOutput(hidden_states, residual, is_final_layer)
 
     def make_transport_frontier(
