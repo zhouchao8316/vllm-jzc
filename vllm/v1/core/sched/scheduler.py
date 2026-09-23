@@ -74,6 +74,10 @@ logger = init_logger(__name__)
 
 _LAYERED_PREFILL_TRACE = os.getenv("VLLM_LAYERED_PREFILL_TRACE") == "1"
 
+# Zero-token layered steps tolerated before the stall recovery preempts the
+# head-of-line running request to return its KV reservation to the pool.
+_LAYERED_STALL_RECOVERY_STEPS = 64
+
 
 class Scheduler(SchedulerInterface):
     def __init__(
@@ -101,6 +105,7 @@ class Scheduler(SchedulerInterface):
         self._pending_layered_admission: tuple[Any, ...] | None = None
         self._layered_fallback_counts: dict[str, int] = {}
         self._logged_layered_no_candidate_detail = False
+        self._layered_stall_steps = 0
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
         self.kv_cache_config = kv_cache_config
@@ -460,7 +465,9 @@ class Scheduler(SchedulerInterface):
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         """Schedule one step, optionally using the layered-prefill policy."""
         if self.layered_prefill_policy.enabled:
-            return self._schedule_layered_prefill(throttle_prefills)
+            scheduler_output = self._schedule_layered_prefill(throttle_prefills)
+            self._check_layered_stall(scheduler_output)
+            return scheduler_output
         return self._schedule_regular(throttle_prefills)
 
     def _schedule_layered_prefill(
@@ -558,9 +565,11 @@ class Scheduler(SchedulerInterface):
             RequestStatus.PREEMPTED,
         )
         request_is_new = admission_status == RequestStatus.WAITING
+        # Fuse reserves KV before Decode admission so a miss can still run
+        # ready decodes. Non-fuse admission also happens before the token
+        # budget is carved: a failed reservation falls back to regular
+        # scheduling with the full budget, including MTP lookahead slots.
         if request_needs_admission and self._fuse_mixed_batch_active():
-            # Decide admission before holding decodes. A miss must not return
-            # the held schedule: that schedule skipped every ready decode.
             self._remove_layered_candidate_from_waiting(candidate)
             if len(self.running) >= self.max_num_running_reqs:
                 self._log_layered_fallback("max_running")
@@ -575,9 +584,54 @@ class Scheduler(SchedulerInterface):
                 return self._schedule_after_fused_admission_failed(throttle_prefills)
             self._pending_layered_admission = reservation
         elif request_needs_admission:
-            # Keep the candidate out of the regular waiting traversal while it
-            # admits Decode requests.  It is requeued if the reservation fails.
             self._remove_layered_candidate_from_waiting(candidate)
+            if len(self.running) >= self.max_num_running_reqs:
+                self._log_layered_fallback("max_running")
+                self._requeue_layered_candidate(candidate, admission_status)
+                return self._schedule_regular(throttle_prefills)
+            num_computed_tokens = candidate.num_computed_tokens
+            new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
+            if num_computed_tokens == 0:
+                (
+                    new_computed_blocks,
+                    num_computed_tokens,
+                    candidate.shared_prefix_boundary,
+                ) = self.kv_cache_manager.get_computed_blocks(candidate)
+            new_blocks = self.kv_cache_manager.allocate_slots(
+                candidate,
+                candidate.num_prompt_tokens - num_computed_tokens,
+                num_new_computed_tokens=num_computed_tokens,
+                new_computed_blocks=new_computed_blocks,
+                num_lookahead_tokens=self.num_lookahead_tokens,
+                delay_cache_blocks=True,
+                has_scheduled_reqs=bool(self.running),
+            )
+            if new_blocks is None:
+                self._log_layered_fallback("kv_alloc_failed")
+                if candidate.layered_prefill_group_id == 0:
+                    reset_layered_prefill_request(candidate)
+                self._requeue_layered_candidate(candidate, admission_status)
+                return self._schedule_regular(throttle_prefills)
+            if num_computed_tokens != candidate.num_computed_tokens:
+                candidate.num_computed_tokens = num_computed_tokens
+                self.layered_prefill_policy.plan_chunk(
+                    candidate, num_computed_tokens
+                )
+                query_tokens = candidate.layered_prefill_query_tokens
+            candidate.status = RequestStatus.RUNNING
+            self.running.append(candidate)
+            self._inflight_prefills.add(candidate)
+            zero_ids = self._get_new_block_ids_to_zero()
+            extra_copies, extra_retained = (
+                self.kv_cache_manager.take_kv_cache_block_copies()
+            )
+            self._pending_layered_admission = (
+                new_blocks,
+                num_computed_tokens,
+                zero_ids,
+                extra_copies,
+                extra_retained,
+            )
 
         old_max_tokens = self.max_num_scheduled_tokens
         self.max_num_scheduled_tokens = old_max_tokens - query_tokens
@@ -590,94 +644,59 @@ class Scheduler(SchedulerInterface):
             self._hold_fused_mixed_decodes = False
             self.max_num_scheduled_tokens = old_max_tokens
 
-        if not request_needs_admission and (
+        if request_needs_admission and candidate.status == RequestStatus.RUNNING:
+            if (
+                not candidate.layered_prefill_enabled
+                or candidate not in self.running
+            ):
+                self._pending_layered_admission = None
+                self._log_layered_fallback("preempted_during_decode_admission")
+                return scheduler_output
+        elif not request_needs_admission and (
             not candidate.layered_prefill_enabled
             or candidate.status != RequestStatus.RUNNING
         ):
-            # The regular admission path may have preempted this request to
-            # make room for a higher-priority Decode request.  Its preemption
-            # handler already reset the frontier metadata and requeued it.
             self._log_layered_fallback("preempted_during_decode_admission")
             return scheduler_output
 
-        # A running request already owns its prompt blocks.  A newly admitted
-        # request is removed from the waiting queue and reserves them exactly
-        # once; every later group reuses the reservation.
         if request_needs_admission:
-            if len(self.running) >= self.max_num_running_reqs:
-                self._log_layered_fallback("max_running")
-                if self._pending_layered_admission is not None:
+            if self._pending_layered_admission is None:
+                raise RuntimeError(
+                    f"Layered request {candidate.request_id} lost its KV reservation"
+                )
+            (
+                new_blocks,
+                num_computed_tokens,
+                layered_zero_ids,
+                extra_copies,
+                extra_retained,
+            ) = self._pending_layered_admission
+            self._pending_layered_admission = None
+            if candidate.status != RequestStatus.RUNNING:
+                if len(self.running) >= self.max_num_running_reqs:
+                    self._log_layered_fallback("max_running")
                     self.kv_cache_manager.free(candidate)
-                    self._pending_layered_admission = None
                     self._requeue_layered_candidate(candidate, admission_status)
                     return self._unwind_held_schedule_and_run_decodes(
                         scheduler_output, throttle_prefills
                     )
-                self._requeue_layered_candidate(candidate, admission_status)
-                return scheduler_output
-            if self._pending_layered_admission is not None:
-                (
-                    new_blocks,
-                    num_computed_tokens,
-                    layered_zero_ids,
-                    extra_copies,
-                    extra_retained,
-                ) = self._pending_layered_admission
-                self._pending_layered_admission = None
-            else:
-                # Prefix-cache lookup mirrors the regular waiting path.  Cached
-                # blocks are complete for every layer once the producing request
-                # finished its cohort, so layered requests may reuse them.
-                num_computed_tokens = candidate.num_computed_tokens
-                new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
-                if num_computed_tokens == 0:
-                    (
-                        new_computed_blocks,
-                        num_computed_tokens,
-                        candidate.shared_prefix_boundary,
-                    ) = self.kv_cache_manager.get_computed_blocks(candidate)
-                new_blocks = self.kv_cache_manager.allocate_slots(
-                    candidate,
-                    candidate.num_prompt_tokens - num_computed_tokens,
-                    num_new_computed_tokens=num_computed_tokens,
-                    new_computed_blocks=new_computed_blocks,
-                    num_lookahead_tokens=0,
-                    delay_cache_blocks=True,
-                    has_scheduled_reqs=bool(self.running),
-                )
-                if new_blocks is None:
-                    self._log_layered_fallback("kv_alloc_failed")
-                    if candidate.layered_prefill_group_id == 0:
-                        reset_layered_prefill_request(candidate)
-                    self._requeue_layered_candidate(candidate, admission_status)
-                    if self._fuse_mixed_batch_active():
-                        return self._unwind_held_schedule_and_run_decodes(
-                            scheduler_output, throttle_prefills
-                        )
-                    return scheduler_output
-                layered_zero_ids = self._get_new_block_ids_to_zero()
-                extra_copies, extra_retained = (
-                    self.kv_cache_manager.take_kv_cache_block_copies()
-                )
-            if num_computed_tokens != candidate.num_computed_tokens:
-                candidate.num_computed_tokens = num_computed_tokens
-                # Re-plan the first chunk from the cache-hit position so
-                # only uncached tokens consume query budget.
-                self.layered_prefill_policy.plan_chunk(
-                    candidate, num_computed_tokens
-                )
-                query_tokens = candidate.layered_prefill_query_tokens
-            candidate.status = RequestStatus.RUNNING
-            self.running.append(candidate)
-            self._inflight_prefills.add(candidate)
+                if num_computed_tokens != candidate.num_computed_tokens:
+                    candidate.num_computed_tokens = num_computed_tokens
+                    self.layered_prefill_policy.plan_chunk(
+                        candidate, num_computed_tokens
+                    )
+                    query_tokens = candidate.layered_prefill_query_tokens
+                candidate.status = RequestStatus.RUNNING
+                self.running.append(candidate)
+                self._inflight_prefills.add(candidate)
             if layered_zero_ids:
                 existing_zero_ids = scheduler_output.new_block_ids_to_zero or []
                 scheduler_output.new_block_ids_to_zero = (
                     existing_zero_ids + layered_zero_ids
                 )
-            # allocate_slots ran after _schedule_regular already drained
-            # CoW copies.  A partial prefix hit must still reach the worker
-            # on this step. Copies were taken with the reservation above.
+            # allocate_slots ran before or beside _schedule_regular, which
+            # drains CoW copies. A partial prefix hit must still reach the
+            # worker on this step.
             if extra_copies:
                 existing_copies = scheduler_output.kv_cache_block_copies or []
                 scheduler_output.kv_cache_block_copies = (
@@ -686,14 +705,12 @@ class Scheduler(SchedulerInterface):
                 self._free_cow_retained_blocks(
                     extra_retained, self.sched_step_seq + 1
                 )
-            # Prefix+suffix, not allocate_slots' new suffix alone.
             assigned_blocks = self.kv_cache_manager.get_blocks(
                 candidate.request_id
             )
             # V2 finish_requests drops preempted ids, so resume must re-enter
-            # through NewRequestData (regular path: scheduled_new_reqs.extend(
-            # scheduled_resumed_reqs)).  V1 keeps the request and replaces
-            # the block table via CachedRequestData.
+            # through NewRequestData. V1 keeps the request and replaces the
+            # block table via CachedRequestData.
             emit_as_new = request_is_new or self.use_v2_model_runner
             if emit_as_new:
                 scheduler_output.scheduled_new_reqs.append(
@@ -717,9 +734,6 @@ class Scheduler(SchedulerInterface):
                     scheduler_output.scheduled_cached_reqs, cached
                 )
         elif not candidate.layered_prefill_kv_reserved:
-            # This branch is only reachable for a request restored by an
-            # external scheduler implementation.  Preserve the same invariant
-            # rather than silently appending duplicate blocks.
             raise RuntimeError(
                 f"Layered request {candidate.request_id} has no KV reservation"
             )
@@ -875,6 +889,30 @@ class Scheduler(SchedulerInterface):
         request.status = status
         self.waiting.prepend_request(request)
 
+    def _check_layered_stall(self, scheduler_output: SchedulerOutput) -> None:
+        # A healthy layered step schedules something whenever unfinished
+        # requests exist: a pending request is the candidate on its
+        # already-reserved KV, and Decode rows go through the regular path.
+        # A zero-token step means every running request is blocked and the
+        # candidate's full-prompt admission keeps failing; preempting the
+        # head-of-line request returns its KV blocks so the candidate can
+        # proceed, trading one recompute for unwedging the engine.
+        if (
+            scheduler_output.total_num_scheduled_tokens
+            or not self.has_unfinished_requests()
+            or self._pause_state != PauseState.UNPAUSED
+        ):
+            self._layered_stall_steps = 0
+            return
+        self._layered_stall_steps += 1
+        if self._layered_stall_steps < _LAYERED_STALL_RECOVERY_STEPS:
+            return
+        self._layered_stall_steps = 0
+        if not self.running:
+            return
+        victim = self.running[0]
+        self._reset_or_preempt_layered_request(victim)
+
     def _reset_or_preempt_layered_request(self, request: Request) -> None:
         """Drop partial layered state before falling back to token scheduling."""
         if request.status == RequestStatus.RUNNING:
@@ -997,7 +1035,7 @@ class Scheduler(SchedulerInterface):
             candidate.num_prompt_tokens - num_computed_tokens,
             num_new_computed_tokens=num_computed_tokens,
             new_computed_blocks=new_computed_blocks,
-            num_lookahead_tokens=0,
+            num_lookahead_tokens=self.num_lookahead_tokens,
             delay_cache_blocks=True,
             has_scheduled_reqs=bool(self.running),
         )
@@ -1462,16 +1500,20 @@ class Scheduler(SchedulerInterface):
         )
 
     def _layered_prefill_supported_for_scheduler(self) -> bool:
-        # Connector / DBO / KV-transfer stay closed.  Prefix caching and
-        # chunked layered are supported on V1 after origin's Sep 14 work.
-        # Async scheduling still requires the V2 worker (serialized groups).
+        # Connector / DBO / KV-transfer stay closed.  Prefix caching is
+        # supported.  Async scheduling is valid at PP=1, including Model
+        # Runner V2.  PP>1 stays closed: async PP replaces the token echo
+        # with a GPU broadcast ring that the layered one-send payload does
+        # not join.
         parallel_config = self.parallel_config
         kv_transfer_config = self.vllm_config.kv_transfer_config
         layered_config = self.layered_prefill_policy.config
-        async_ok = self.use_v2_model_runner or not self.scheduler_config.async_scheduling
         return bool(
             parallel_config.pipeline_parallel_size >= 1
-            and async_ok
+            and not (
+                self.scheduler_config.async_scheduling
+                and parallel_config.pipeline_parallel_size > 1
+            )
             and not getattr(parallel_config, "enable_dbo", False)
             and (
                 not layered_config.require_eager

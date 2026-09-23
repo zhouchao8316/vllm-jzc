@@ -15,6 +15,7 @@ from vllm.config import (
     SpeculativeConfig,
     VllmConfig,
 )
+from vllm.config.compilation import CompilationConfig, CUDAGraphMode
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
     MultiModalKwargsItem,
@@ -70,6 +71,9 @@ def create_scheduler(
     ec_role: str | None = None,
     use_v2_model_runner: bool | None = None,
     kv_cache_spec: KVCacheSpec | None = None,
+    additional_config: dict | None = None,
+    cudagraph_mode: str | None = None,
+    enforce_eager: bool = False,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -90,6 +94,7 @@ def create_scheduler(
         dtype="float16",
         seed=42,
         skip_tokenizer_init=skip_tokenizer_init,
+        enforce_eager=enforce_eager,
     )
     if max_model_len is None:
         max_model_len = max_num_batched_tokens
@@ -162,6 +167,13 @@ def create_scheduler(
         else None
     )
 
+    optional_config_kwargs: dict = {}
+    if additional_config is not None:
+        optional_config_kwargs["additional_config"] = additional_config
+    if cudagraph_mode is not None:
+        optional_config_kwargs["compilation_config"] = CompilationConfig(
+            cudagraph_mode=CUDAGraphMode[cudagraph_mode]
+        )
     vllm_config = VllmConfig(
         scheduler_config=scheduler_config,
         model_config=model_config,
@@ -173,6 +185,7 @@ def create_scheduler(
         kv_transfer_config=kv_transfer_config,
         speculative_config=speculative_config,
         ec_transfer_config=ec_transfer_config,
+        **optional_config_kwargs,
     )
     if kv_cache_spec is None:
         kv_cache_spec = FullAttentionSpec(

@@ -1002,3 +1002,253 @@ def test_orphaned_fused_rider_resumes_next_group_not_layer0():
     assert first.layered_fused_decode_slot
     assert first.layered_fused_resume_group == 2
     assert second.request_id not in resumed.num_scheduled_tokens
+_LAYERED_ASYNC_ADDITIONAL_CONFIG = {
+    "scheduler_config": {
+        "layered_prefill_config": {
+            "enabled": True,
+            # The test model is not forced eager and the cohort runs without
+            # Decode work, so relax the phase-one eligibility knobs.
+            "require_eager": False,
+            "require_pd_mixed": False,
+        }
+    }
+}
+
+
+def _run_async_step(scheduler: Scheduler, sched_output: SchedulerOutput) -> None:
+    """Emulate the worker for one scheduler step.
+
+    Only the final layer group of the final chunk samples a token; every
+    other scheduled row (regular Decode or an intermediate layer group)
+    returns none, mirroring the layered worker protocol.
+    """
+    plan = sched_output.layered_prefill_plan
+    req_ids = list(sched_output.num_scheduled_tokens)
+    sampled_token_ids = [
+        [0]
+        if plan is None or plan.is_sampling_step or req_id not in plan.query_tokens
+        else []
+        for req_id in req_ids
+    ]
+    model_runner_output = ModelRunnerOutput(
+        req_ids=req_ids,
+        req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
+        sampled_token_ids=sampled_token_ids,
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    scheduler.update_from_output(sched_output, model_runner_output)
+
+
+@pytest.mark.cpu_test
+def test_async_scheduler_layered_prefill_placeholder_protocol():
+    """The layered request's first sampled token must be accounted as an
+    async output placeholder when the final layer group is scheduled, and
+    cleared once the worker delivers the token."""
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        additional_config=_LAYERED_ASYNC_ADDITIONAL_CONFIG,
+        cudagraph_mode="NONE",
+        enforce_eager=True,
+    )
+    (request,) = create_requests(
+        num_requests=1, num_tokens=520, max_tokens=2, ignore_eos=True
+    )
+    scheduler.add_request(request)
+
+    sched_output = scheduler.schedule()
+    plan = sched_output.layered_prefill_plan
+    assert plan is not None and plan.num_groups == 2
+    # Intermediate layer group: the request executes but samples nothing.
+    assert not plan.is_sampling_step
+    assert request.num_output_placeholders == 0
+    _run_async_step(scheduler, sched_output)
+    assert request.num_output_placeholders == 0
+
+    sched_output = scheduler.schedule()
+    plan = sched_output.layered_prefill_plan
+    assert plan is not None and plan.is_sampling_step
+    # The step samples the request's first output token, so the async
+    # protocol requires one placeholder at schedule time.
+    assert request.num_output_placeholders == 1
+    _run_async_step(scheduler, sched_output)
+    assert request.num_output_placeholders == 0
+
+    # The prompt finished; the request graduates to regular async decode.
+    sched_output = scheduler.schedule()
+    assert sched_output.layered_prefill_plan is None
+    assert request.num_output_placeholders == 1
+    _run_async_step(scheduler, sched_output)
+    assert request.num_output_placeholders == 0
+    assert request.num_output_tokens == 2
+    assert scheduler.get_num_unfinished_requests() == 0
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("num_speculative_tokens", [1, 2])
+def test_async_scheduler_layered_prefill_first_decode_step_has_no_draft_slots(
+    num_speculative_tokens: int,
+):
+    """The layered request's first decode step schedules no draft slots.
+
+    The async placeholder loop in ``_update_after_schedule`` runs before the
+    layered append, so the request's spec_token_ids stay empty when the final
+    layer group samples.  Draft slots only appear from the step after its
+    first decode step.  This is the contract that lets the worker skip the
+    layered P subbatch's propose under async scheduling without losing any
+    consumer.
+    """
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        additional_config=_LAYERED_ASYNC_ADDITIONAL_CONFIG,
+        cudagraph_mode="NONE",
+        enforce_eager=True,
+        num_speculative_tokens=num_speculative_tokens,
+    )
+    (request,) = create_requests(
+        num_requests=1, num_tokens=520, max_tokens=6, ignore_eos=True
+    )
+    scheduler.add_request(request)
+    req_id = request.request_id
+
+    # Intermediate group: no sampling, no draft slots.
+    sched_output = scheduler.schedule()
+    assert sched_output.layered_prefill_plan is not None
+    assert req_id not in sched_output.scheduled_spec_decode_tokens
+    _run_async_step(scheduler, sched_output)
+
+    # Final group samples the first token; still no draft slots.
+    sched_output = scheduler.schedule()
+    assert sched_output.layered_prefill_plan is not None
+    assert sched_output.layered_prefill_plan.is_sampling_step
+    assert req_id not in sched_output.scheduled_spec_decode_tokens
+    _run_async_step(scheduler, sched_output)
+
+    # First decode step: exactly one token, no draft slots.
+    sched_output = scheduler.schedule()
+    assert sched_output.layered_prefill_plan is None
+    assert req_id not in sched_output.scheduled_spec_decode_tokens
+    assert sched_output.num_scheduled_tokens[req_id] == 1
+    _run_async_step(scheduler, sched_output)
+
+    # From the next step on, regular async spec decode provides the slots.
+    sched_output = scheduler.schedule()
+    assert sched_output.layered_prefill_plan is None
+    draft_slots = sched_output.scheduled_spec_decode_tokens[req_id]
+    assert len(draft_slots) == num_speculative_tokens
+    assert sched_output.num_scheduled_tokens[req_id] == 1 + num_speculative_tokens
+
+
+@pytest.mark.cpu_test
+def test_async_scheduler_layered_prefill_gate_falls_back_for_pp2():
+    """async scheduling with PP>1 stays on regular token scheduling."""
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        additional_config=_LAYERED_ASYNC_ADDITIONAL_CONFIG,
+        cudagraph_mode="NONE",
+        enforce_eager=True,
+    )
+    # Emulate PP>1 at the scheduler level; constructing with
+    # pipeline_parallel_size>1 requires that many visible GPUs.
+    scheduler.parallel_config.pipeline_parallel_size = 2
+    assert not scheduler._layered_prefill_supported_for_scheduler()
+
+    (request,) = create_requests(
+        num_requests=1, num_tokens=520, max_tokens=2, ignore_eos=True
+    )
+    scheduler.add_request(request)
+    sched_output = scheduler.schedule()
+    assert sched_output.layered_prefill_plan is None
+    assert not request.layered_prefill_enabled
+
+
+@pytest.mark.cpu_test
+def test_layered_admission_failure_does_not_starve_decode():
+    """When the waiting candidate's full-prompt reservation fails, the step
+    must fall back to regular scheduling with the full token budget so the
+    running request's Decode rows keep executing, instead of the doomed
+    candidate's query budget starving them into zero-token steps."""
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        additional_config=_LAYERED_ASYNC_ADDITIONAL_CONFIG,
+        cudagraph_mode="NONE",
+        enforce_eager=True,
+    )
+    first, blocked = create_requests(
+        num_requests=2, num_tokens=520, max_tokens=8, ignore_eos=True
+    )
+    scheduler.add_request(first)
+    scheduler.add_request(blocked)
+
+    # The first request runs through its two layer groups and samples.
+    for _ in range(2):
+        sched_output = scheduler.schedule()
+        assert sched_output.total_num_scheduled_tokens > 0
+        assert scheduler._layered_stall_steps == 0
+        _run_async_step(scheduler, sched_output)
+
+    # `first` is now a decode request. Fail every full-prompt reservation
+    # (the pool cannot fit a second request) while small decode allocations
+    # keep succeeding.
+    kv_cache_manager = scheduler.kv_cache_manager
+    original_allocate_slots = kv_cache_manager.allocate_slots
+
+    def fail_full_prompt_reservations(request, num_new_tokens, *args, **kwargs):
+        if num_new_tokens > 100:
+            return None
+        return original_allocate_slots(request, num_new_tokens, *args, **kwargs)
+
+    kv_cache_manager.allocate_slots = fail_full_prompt_reservations
+    try:
+        for _ in range(3):
+            sched_output = scheduler.schedule()
+            # The decode row survives the failed layered admission.
+            assert sched_output.total_num_scheduled_tokens == 1
+            assert first.status == RequestStatus.RUNNING
+            assert blocked.status == RequestStatus.WAITING
+            assert scheduler._layered_stall_steps == 0
+            _run_async_step(scheduler, sched_output)
+    finally:
+        kv_cache_manager.allocate_slots = original_allocate_slots
+
+    # With the reservation restorable the waiting request is admitted again.
+    sched_output = scheduler.schedule()
+    assert blocked.status == RequestStatus.RUNNING
+    assert sched_output.total_num_scheduled_tokens > 0
+
+
+@pytest.mark.cpu_test
+def test_layered_stall_watchdog_preempts_unschedulable_running_request():
+    """The stall watchdog is the backstop for zero-token steps that regular
+    preemption cannot resolve, e.g. a running request whose decode rows are
+    deferred indefinitely with no waiting request to drive admission."""
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        additional_config=_LAYERED_ASYNC_ADDITIONAL_CONFIG,
+        cudagraph_mode="NONE",
+        enforce_eager=True,
+    )
+    (wedged,) = create_requests(
+        num_requests=1, num_tokens=520, max_tokens=4, ignore_eos=True
+    )
+    scheduler.add_request(wedged)
+
+    for _ in range(2):
+        sched_output = scheduler.schedule()
+        assert sched_output.total_num_scheduled_tokens > 0
+        _run_async_step(scheduler, sched_output)
+
+    wedged.next_decode_eligible_step = 10**9
+    for step in range(_LAYERED_STALL_RECOVERY_STEPS):
+        assert scheduler.schedule().total_num_scheduled_tokens == 0
+    assert step == _LAYERED_STALL_RECOVERY_STEPS - 1
+
+    assert wedged.status == RequestStatus.PREEMPTED
+    assert wedged not in scheduler.running
+    assert wedged in scheduler.waiting
+    assert scheduler._layered_stall_steps == 0
+
+    sched_output = scheduler.schedule()
+    assert sched_output.total_num_scheduled_tokens > 0
+    assert wedged.status == RequestStatus.RUNNING

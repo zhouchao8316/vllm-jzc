@@ -1456,9 +1456,18 @@ class GPUModelRunner(
                 # The request was either preempted and resumed later, or was not
                 # scheduled in the previous step and needs to be added again.
 
-                if self.use_async_scheduling and num_output_tokens > 0:
+                if (
+                    self.use_async_scheduling
+                    and num_output_tokens > 0
+                    and req_id in req_data.all_token_ids
+                ):
                     # We must recover the output token ids for resumed requests in the
                     # async scheduling case, so that correct input_ids are obtained.
+                    # Requests the previous step did schedule carry no
+                    # all_token_ids payload; e.g. a layered-prefill request
+                    # finishing its last layer group resolves its own first
+                    # sampled token on the worker, because the next schedule()
+                    # runs before update_from_output() of that step.
                     resumed_token_ids = req_data.all_token_ids[req_id]
                     req_state.output_token_ids = resumed_token_ids[-num_output_tokens:]
 

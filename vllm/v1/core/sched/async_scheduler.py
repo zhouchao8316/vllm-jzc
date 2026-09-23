@@ -48,6 +48,21 @@ class AsyncScheduler(Scheduler):
                 # scheduled for decode (for PP microbatching).
                 request.next_decode_eligible_step = self.current_step + self.pp_size
 
+    def _update_after_layered_schedule(
+        self, request: Request, scheduler_output: SchedulerOutput
+    ) -> None:
+        super()._update_after_layered_schedule(request, scheduler_output)
+        plan = scheduler_output.layered_prefill_plan
+        if plan is None or not plan.is_sampling_step:
+            # Intermediate layer groups deliver no output tokens.
+            return
+        # The layered request is appended to num_scheduled_tokens after
+        # _update_after_schedule ran inside _schedule_regular, so the
+        # placeholder bookkeeping there never sees it. Account for the first
+        # sampled token here, matching the async protocol, or
+        # update_from_output would drive num_output_placeholders below zero.
+        request.num_output_placeholders += self.num_sampled_tokens_per_step
+
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int], is_stale: bool = False
     ) -> tuple[list[int], bool]:
