@@ -167,3 +167,83 @@ def test_standard_adapter_rejects_nonstandard_layer_state(special_layer):
 
     with pytest.raises(TypeError, match="standard decoder layer contract"):
         StandardDecoderLayeredPrefillAdapter(model)
+
+
+class _AuxBackbone(_DecoderBackbone):
+    """A 4-layer backbone with two configured aux capture layers."""
+
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(num_hidden_layers=4)
+        self.end_layer = 4
+        self.layers = nn.ModuleList(_DecoderLayer(i) for i in range(4))
+        self.aux_hidden_state_layers = (3, 4)
+
+
+class _AuxCausalLM(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = _AuxBackbone()
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
+        )
+
+    def forward(self, input_ids, positions):
+        return self.model(input_ids, positions)
+
+
+class _AuxAdapter(StandardDecoderLayeredPrefillAdapter):
+    def _capture_aux_hidden_state(self, global_idx, hidden_states, residual):
+        return hidden_states.clone()
+
+
+def test_adapter_collects_aux_hidden_states_from_owning_group():
+    model = _AuxCausalLM()
+    adapter = _AuxAdapter(model)
+    input_ids = torch.tensor([2, 5])
+    positions = torch.arange(2)
+
+    early = adapter.forward(
+        input_ids=input_ids, positions=positions, layer_start=0, layer_end=2
+    )
+    owner = adapter.forward(
+        input_ids=input_ids, positions=positions, layer_start=2, layer_end=4
+    )
+
+    assert early.aux_hidden_states is None
+    assert owner.aux_hidden_states is not None
+    assert len(owner.aux_hidden_states) == 2
+    # Aux fires after layers 2 and 3 (layer_idx + 1 in {3, 4}); each layer
+    # adds its own increment (2, then 3) to the embeddings.
+    torch.testing.assert_close(
+        owner.aux_hidden_states[0], torch.tensor([[4.0], [7.0]])
+    )
+    torch.testing.assert_close(
+        owner.aux_hidden_states[1], torch.tensor([[7.0], [10.0]])
+    )
+
+
+def test_adapter_fails_closed_when_group_splits_aux_layers():
+    model = _AuxCausalLM()
+    adapter = _AuxAdapter(model)
+
+    with pytest.raises(RuntimeError, match="splits"):
+        adapter.forward(
+            input_ids=torch.tensor([2]),
+            positions=torch.arange(1),
+            layer_start=2,
+            layer_end=3,
+        )
+
+
+def test_adapter_fails_closed_without_model_capture_hook():
+    model = _AuxCausalLM()
+    adapter = StandardDecoderLayeredPrefillAdapter(model)
+
+    with pytest.raises(RuntimeError, match="aux hidden-state capture"):
+        adapter.forward(
+            input_ids=torch.tensor([2]),
+            positions=torch.arange(1),
+            layer_start=2,
+            layer_end=4,
+        )

@@ -38,6 +38,10 @@ class LayeredPrefillModelAdapter(ABC):
         self.start_layer = int(self.backbone.start_layer)
         self.end_layer = int(self.backbone.end_layer)
         self.num_hidden_layers = int(self.backbone.config.num_hidden_layers)
+        # Aux capture layers are configured by the worker when a drafter
+        # consumes target aux hidden states (DSpark / EAGLE3).  The set is
+        # read lazily on each forward so drafter setup order does not matter.
+        self._aux_hidden_state_layers: tuple[int, ...] = ()
         self._validate_structure()
 
     @staticmethod
@@ -131,6 +135,21 @@ class LayeredPrefillModelAdapter(ABC):
     ) -> LayeredPrefillFrontier:
         """Apply the model's final hidden-state transformation."""
 
+    def _capture_aux_hidden_state(
+        self,
+        global_idx: int,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """Return the aux hidden state captured after layer ``global_idx``.
+
+        The default returns ``None``: aux capture formulas are model-specific
+        (e.g. ``hidden_states + residual`` versus a hyper-connection mean), so
+        a model must opt in by overriding this hook.  ``None`` from a model
+        that declared aux layers fails closed in :meth:`forward`.
+        """
+        return None
+
     def forward(
         self,
         *,
@@ -182,6 +201,31 @@ class LayeredPrefillModelAdapter(ABC):
 
         local_start = max(layer_start, self.start_layer)
         local_end = min(layer_end, self.end_layer)
+        # Refresh the aux layer set on every forward: the worker configures it
+        # during drafter loading, which can happen after adapter creation.
+        aux_layers = tuple(getattr(self.backbone, "aux_hidden_state_layers", ()))
+        self._aux_hidden_state_layers = aux_layers
+        aux_set = set(aux_layers)
+        # Aux capture mirrors the model's own forward semantics: the state is
+        # captured after layer ``i`` when ``i + 1`` is an aux layer.  Phase 1
+        # requires every aux source layer to live inside a single (the last)
+        # group; a layout that splits them cannot produce a complete, ordered
+        # aux list at any group boundary, so fail closed instead of silently
+        # feeding the drafter partial states.
+        aux_sources = {layer_id - 1 for layer_id in aux_set if layer_id > 0}
+        group_range = range(layer_start, layer_end)
+        if aux_sources & set(group_range) and not aux_sources.issubset(
+            group_range
+        ):
+            # A group that touches any aux source layer must own all of them,
+            # otherwise the aux list it produces is partial and unordered
+            # relative to the model's own forward.
+            raise RuntimeError(
+                f"Layered prefill group [{layer_start}, {layer_end}) splits "
+                f"aux capture source layers {sorted(aux_sources)}; regroup "
+                "so every aux layer lands in the final group"
+            )
+        aux_hidden_states: list[torch.Tensor] = []
         for global_idx in range(local_start, local_end):
             layer = self.layers[global_idx]
             if isinstance(layer, PPMissingLayer):
@@ -203,6 +247,17 @@ class LayeredPrefillModelAdapter(ABC):
                     enter_rows,
                 )
                 enter_rows = int(hidden_states.shape[0])
+            if (global_idx + 1) in aux_set:
+                captured = self._capture_aux_hidden_state(
+                    global_idx, hidden_states, residual
+                )
+                if captured is None:
+                    raise RuntimeError(
+                        f"{type(self.model).__name__} does not implement "
+                        "layered aux hidden-state capture, but aux layers "
+                        f"{sorted(aux_set)} are configured"
+                    )
+                aux_hidden_states.append(captured)
             if trace_layered:
                 logger.info(
                     "Layered trace layer=%d hidden_sum=%.6e residual_sum=%s",
@@ -226,7 +281,12 @@ class LayeredPrefillModelAdapter(ABC):
                 None if residual is None else tuple(residual.shape),
                 is_final_layer,
             )
-        return LayeredForwardOutput(hidden_states, residual, is_final_layer)
+        return LayeredForwardOutput(
+            hidden_states,
+            residual,
+            is_final_layer,
+            aux_hidden_states if aux_hidden_states else None,
+        )
 
     def make_transport_frontier(
         self,

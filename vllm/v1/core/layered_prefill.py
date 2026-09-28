@@ -531,6 +531,11 @@ class LayeredForwardOutput:
     hidden_states: Any
     residual: Any | None
     is_final_layer: bool
+    # Aux hidden states captured at the model's aux layers (e.g. DSpark /
+    # EAGLE3 target layers) for the tokens executed in this group.  Only the
+    # group whose range covers every aux layer can produce a complete list;
+    # ``None`` means this model does not capture aux states.
+    aux_hidden_states: list[Any] | None = None
 
 
 class LayeredPrefillPolicy:
