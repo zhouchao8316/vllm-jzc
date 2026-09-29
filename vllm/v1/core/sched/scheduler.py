@@ -513,6 +513,23 @@ class Scheduler(SchedulerInterface):
             max_seq_len[req_id] = prompt_len + int(request.max_tokens)
         layered = scheduler_output.layered_prefill_plan
         sampling_step = None if layered is None else bool(layered.is_sampling_step)
+        if (
+            layered is not None
+            and not sampling_step
+            and not self._fuse_mixed_batch_active()
+        ):
+            # Serial D runs the full model even when this P group cannot
+            # sample. Decide globally from scheduler cursors, not rank masks.
+            # Fuse keeps the plan bit: riders sample only on the last group.
+            p_ids = set(layered.prefill_req_ids)
+            sampling_step = any(
+                old_computed[req_id] + scheduler_output.num_scheduled_tokens[req_id]
+                >= prefill_len[req_id]
+                and max(old_computed[req_id], prefill_len[req_id]) + 1
+                < max_seq_len[req_id]
+                for req_id in order
+                if req_id not in p_ids
+            )
         self._ring_step_seq += 1
         scheduler_output.ring_step_plan = build_ring_step_plan(
             step_id=self._ring_step_seq,
