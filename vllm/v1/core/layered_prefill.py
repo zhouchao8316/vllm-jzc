@@ -603,6 +603,13 @@ class LayeredPrefillPolicy:
             raise ValueError(
                 "layered prefill chunk start must leave prompt tokens"
             )
+        origin = getattr(request, "layered_prefill_chunk_origin", None)
+        if origin is not None and int(chunk_start) < int(origin):
+            raise RuntimeError(
+                "layered prefill chunk cursor moved backward: "
+                f"{int(origin)} -> {int(chunk_start)}"
+            )
+        request.layered_prefill_chunk_origin = int(chunk_start)
         query_tokens = remaining
         if self.max_num_batched_tokens > 0:
             query_tokens = min(query_tokens, self.max_num_batched_tokens)
@@ -612,7 +619,12 @@ class LayeredPrefillPolicy:
             group_token_target=self.config.group_token_target,
             allowed_num_groups=self.config.allowed_num_groups,
         )
-        if self.pipeline_parallel_size > 1:
+        if self.pipeline_parallel_size > 1 and self.config.fuse_mixed_batch:
+            # One scheduler step already walks every PP stage (rank-local
+            # layers inside the global range).  Splitting that step into one
+            # group per stage would leave the other ranks idle.
+            num_groups = 1
+        elif self.pipeline_parallel_size > 1:
             # A group must have one unambiguous PP owner.  Prefer the
             # configured layout, but never allow fewer groups than stages.
             num_groups = min(
@@ -632,12 +644,19 @@ class LayeredPrefillPolicy:
             raise ValueError("request is not enabled for layered prefill")
         num_groups = request.layered_prefill_num_groups
         group_id = request.layered_prefill_group_id
-        ranges = make_pp_aligned_layer_group_ranges(
-            self.num_hidden_layers,
-            num_groups,
-            self.pipeline_parallel_size,
-        )
-        layer_range = ranges[group_id]
+        if (
+            self.config.fuse_mixed_batch
+            and self.pipeline_parallel_size > 1
+            and num_groups == 1
+        ):
+            layer_range = LayerGroupRange(0, 0, self.num_hidden_layers)
+        else:
+            ranges = make_pp_aligned_layer_group_ranges(
+                self.num_hidden_layers,
+                num_groups,
+                self.pipeline_parallel_size,
+            )
+            layer_range = ranges[group_id]
         query_tokens = request.layered_prefill_query_tokens
         return LayeredPrefillPlan(
             version=1,
@@ -681,6 +700,7 @@ def reset_layered_prefill_request(request: Any) -> None:
     request.layered_prefill_query_tokens = 0
     request.layered_prefill_kv_reserved = False
     request.layered_prefill_cached_tokens = 0
+    request.layered_prefill_chunk_origin = None
     request.layered_fused_decode_ids = None
     request.layered_fused_decode_owner = None
     request.layered_fused_resume_group = 0

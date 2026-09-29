@@ -1075,10 +1075,30 @@ class Worker(WorkerBase):
                 comm_postprocess=comm_postprocess,
             )
 
+        trace_chunk = os.environ.get("VLLM_PP_CHUNK_TIMELINE") == "1" and forward_pass
+        trace_t0 = time.perf_counter() if trace_chunk else 0.0
         with self.annotate_profile(scheduler_output):
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
             )
+            if trace_chunk and any(
+                n > 1 for n in scheduler_output.num_scheduled_tokens.values()
+            ):
+                self._pp_chunk_trace_step = (
+                    getattr(self, "_pp_chunk_trace_step", 0) + 1
+                )
+                logger.info(
+                    "pp_chunk_timeline rank=%s step=%s tokens=%s ids=%s t0=%.6f t1=%.6f",
+                    get_pp_group().rank_in_group,
+                    self._pp_chunk_trace_step,
+                    num_scheduled_tokens,
+                    ",".join(
+                        f"{req_id}:{n}"
+                        for req_id, n in scheduler_output.num_scheduled_tokens.items()
+                    ),
+                    trace_t0,
+                    time.perf_counter(),
+                )
             if (
                 self.use_v2_model_runner
                 and self.model_runner.is_pooling_model

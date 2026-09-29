@@ -1215,6 +1215,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
+            if self.pp_handler is not None:
+                # Same object on every PP rank. broadcast/receive must not
+                # replace it with a local skip.
+                self.pp_handler.bind_plan(
+                    getattr(scheduler_output, "ring_step_plan", None)
+                )
             # Update the request states.
             self.update_pp_decode_requests()
             self.finish_requests(scheduler_output)

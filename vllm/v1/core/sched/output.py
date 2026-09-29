@@ -264,6 +264,11 @@ class SchedulerOutput:
     # token-progress scheduler and is the default for every model.
     layered_prefill_plan: "LayeredPrefillPlan | None" = None
 
+    # Sampled-token collective for this step. Identical on every PP rank.
+    # ``None`` when pipeline parallelism is off. When set, workers must
+    # enter or skip together; a local mask must not decide participation.
+    ring_step_plan: "RingStepPlan | None" = None
+
     # Producer partial-tail offload hand-off for external KV connectors:
     # {request_id: [(group_id, block_id, boundary_tokens), ...]} pointing at
     # the durable boundary block of a producer's last-prompt-boundary partial

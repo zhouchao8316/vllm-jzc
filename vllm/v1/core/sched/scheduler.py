@@ -320,6 +320,9 @@ class Scheduler(SchedulerInterface):
             self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+        # Monotonic id stamped into RingStepPlan. Not current_step: layered
+        # groups do not all advance that counter.
+        self._ring_step_seq = 0
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
         # cadence (`next_decode_eligible_step`).
@@ -467,8 +470,61 @@ class Scheduler(SchedulerInterface):
         if self.layered_prefill_policy.enabled:
             scheduler_output = self._schedule_layered_prefill(throttle_prefills)
             self._check_layered_stall(scheduler_output)
-            return scheduler_output
-        return self._schedule_regular(throttle_prefills)
+        else:
+            scheduler_output = self._schedule_regular(throttle_prefills)
+        self._attach_ring_step_plan(scheduler_output)
+        return scheduler_output
+
+    def _attach_ring_step_plan(self, scheduler_output: SchedulerOutput) -> None:
+        """Stamp one sampled-token collective plan onto this step.
+
+        Every PP rank receives this object inside ``SchedulerOutput``.
+        Workers must not replace it with a local mask.
+        """
+        from vllm.v1.worker.gpu.pp_utils import build_ring_step_plan
+
+        pp_size = int(self.parallel_config.pipeline_parallel_size)
+        if pp_size <= 1:
+            scheduler_output.ring_step_plan = None
+            return
+        order = list(scheduler_output.num_scheduled_tokens)
+        cursors: dict[str, int] = {}
+        for req in scheduler_output.scheduled_new_reqs:
+            cursors[req.req_id] = int(req.num_computed_tokens)
+        cached = scheduler_output.scheduled_cached_reqs
+        for req_id, num_computed in zip(cached.req_ids, cached.num_computed_tokens):
+            cursors[req_id] = int(num_computed)
+        old_computed: dict[str, int] = {}
+        prefill_len: dict[str, int] = {}
+        max_seq_len: dict[str, int] = {}
+        for req_id in order:
+            if req_id not in cursors:
+                raise RuntimeError(
+                    f"RingStepPlan has no pre-step cursor for {req_id}"
+                )
+            request = self.requests.get(req_id)
+            if request is None:
+                raise RuntimeError(
+                    f"RingStepPlan scheduled unknown request {req_id}"
+                )
+            old_computed[req_id] = cursors[req_id]
+            prompt_len = int(request.num_prompt_tokens)
+            prefill_len[req_id] = prompt_len
+            max_seq_len[req_id] = prompt_len + int(request.max_tokens)
+        layered = scheduler_output.layered_prefill_plan
+        sampling_step = None if layered is None else bool(layered.is_sampling_step)
+        self._ring_step_seq += 1
+        scheduler_output.ring_step_plan = build_ring_step_plan(
+            step_id=self._ring_step_seq,
+            pp_size=pp_size,
+            sample_width=int(self.num_spec_tokens) + 1,
+            request_order=order,
+            old_computed=old_computed,
+            num_scheduled=scheduler_output.num_scheduled_tokens,
+            prefill_len=prefill_len,
+            max_seq_len=max_seq_len,
+            sampling_step=sampling_step,
+        )
 
     def _schedule_layered_prefill(
         self, throttle_prefills: bool = False
@@ -782,6 +838,18 @@ class Scheduler(SchedulerInterface):
                 plan.is_final_chunk,
             )
         self._attach_running_decodes_to_layered_output(scheduler_output, candidate)
+        if os.environ.get("VLLM_PP_CHUNK_TIMELINE") == "1" and query_tokens > 1:
+            logger.info(
+                "pp_chunk_sched step=%s req=%s query=%s start=%s computed=%s "
+                "final_chunk=%s sampling=%s",
+                self.current_step,
+                req_id,
+                query_tokens,
+                candidate.num_computed_tokens,
+                candidate.num_computed_tokens + plan.commit_tokens[req_id],
+                plan.is_final_chunk,
+                plan.is_sampling_step,
+            )
         self._update_after_layered_schedule(candidate, scheduler_output)
         self.prev_step_scheduled_req_ids.add(req_id)
         other_ids = [
@@ -904,6 +972,21 @@ class Scheduler(SchedulerInterface):
         ):
             self._layered_stall_steps = 0
             return
+        # A token chunk still on a later PP stage, or the last chunk waiting
+        # to return its first decode token, produces empty schedules. That is
+        # the pipeline draining, not a wedged admission. Preempting here sets
+        # the cursor back to 0 and recomputes the prompt.
+        if any(
+            request.num_in_flight_tokens > 0
+            or (
+                request.num_prompt_tokens > 0
+                and request.num_computed_tokens >= request.num_prompt_tokens
+                and not request.output_token_ids
+            )
+            for request in self.running
+        ):
+            self._layered_stall_steps = 0
+            return
         self._layered_stall_steps += 1
         if self._layered_stall_steps < _LAYERED_STALL_RECOVERY_STEPS:
             return
@@ -929,10 +1012,12 @@ class Scheduler(SchedulerInterface):
                 and self._is_layered_request_eligible(request)
             ):
                 if request.num_in_flight_tokens > 0:
-                    # Previous layer group is still on the worker.  Do not
-                    # pipeline the next group: that consumes Decode tokens
-                    # on an intermediate step and leaves the final group
-                    # P-only (pd_mix_dp_slot needs D ∪ final-P).
+                    # A later layer group of the same tokens must wait: it
+                    # would consume Decode tokens on an intermediate step.
+                    # A full-model token chunk is different. Chunk N+1 may
+                    # enter rank 0 as soon as chunk N has left that rank.
+                    if self._pp_token_chunk_wave(request):
+                        return request
                     in_flight_layered = True
                     continue
                 return request
@@ -1008,6 +1093,22 @@ class Scheduler(SchedulerInterface):
     def _fuse_mixed_batch_active(self) -> bool:
         """Fused mixed: one eager layer-group forward for D+P together."""
         return bool(self.layered_prefill_policy.config.fuse_mixed_batch)
+
+    def _pp_token_chunk_wave(self, request: Request) -> bool:
+        """True when the next token chunk can overlap the previous one.
+
+        Each step already runs every PP stage (one group, rank-local layers).
+        The following chunk is a new token range, not the next layer group,
+        and its cursor has already moved forward.
+        """
+        if not self.use_pp or not self._fuse_mixed_batch_active():
+            return False
+        if int(getattr(request, "layered_prefill_num_groups", 0) or 0) != 1:
+            return False
+        return (
+            request.num_computed_tokens < request.num_prompt_tokens
+            and not request.output_token_ids
+        )
 
     @staticmethod
     def _clear_fused_rider_state(request: Request) -> None:
@@ -1317,6 +1418,9 @@ class Scheduler(SchedulerInterface):
         """
         plan = scheduler_output.layered_prefill_plan
         assert plan is not None
+        # Prefill logits and a riding decode token are both returned only on
+        # the sampling step. A non-final token chunk has no logit yet; committing
+        # a decode row there would count a token the worker never sends back.
         sampling = bool(plan.is_sampling_step)
         remaining = (
             self.max_num_scheduled_tokens - scheduler_output.total_num_scheduled_tokens
@@ -1502,18 +1606,21 @@ class Scheduler(SchedulerInterface):
     def _layered_prefill_supported_for_scheduler(self) -> bool:
         # Connector / DBO / KV-transfer stay closed.  Prefix caching is
         # supported.  Async scheduling is valid at PP=1, including Model
-        # Runner V2.  PP>1 stays closed: async PP replaces the token echo
-        # with a GPU broadcast ring that the layered one-send payload does
-        # not join.
+        # Runner V2.  Multi-group layered PP stays closed: async PP replaces
+        # the token echo with a GPU broadcast ring that the layered one-send
+        # payload does not join.  A fuse token-chunk wave is one full forward
+        # per chunk, so it uses the same sample point as ordinary PP.
         parallel_config = self.parallel_config
         kv_transfer_config = self.vllm_config.kv_transfer_config
         layered_config = self.layered_prefill_policy.config
+        async_pp_blocked = (
+            self.scheduler_config.async_scheduling
+            and parallel_config.pipeline_parallel_size > 1
+            and not layered_config.fuse_mixed_batch
+        )
         return bool(
             parallel_config.pipeline_parallel_size >= 1
-            and not (
-                self.scheduler_config.async_scheduling
-                and parallel_config.pipeline_parallel_size > 1
-            )
+            and not async_pp_blocked
             and not getattr(parallel_config, "enable_dbo", False)
             and (
                 not layered_config.require_eager
@@ -2501,6 +2608,13 @@ class Scheduler(SchedulerInterface):
         self._free_request_blocks(request)
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)
+        if request.layered_prefill_enabled and request.num_computed_tokens > 0:
+            logger.warning(
+                "pp_chunk_rewind req=%s computed=%s in_flight=%s",
+                request.request_id,
+                request.num_computed_tokens,
+                request.num_in_flight_tokens,
+            )
         if request.layered_prefill_enabled:
             reset_layered_prefill_request(request)
         request.layered_fused_decode_ids = None
@@ -2544,6 +2658,18 @@ class Scheduler(SchedulerInterface):
             request = self.requests[req_id]
             request.num_computed_tokens += num_scheduled_token
             request.num_in_flight_tokens += num_scheduled_token
+            if (
+                os.environ.get("VLLM_PP_CHUNK_TIMELINE") == "1"
+                and num_scheduled_token > 1
+            ):
+                logger.info(
+                    "pp_chunk_sched step=%s req=%s query=%s start=%s computed=%s",
+                    self.current_step,
+                    req_id,
+                    num_scheduled_token,
+                    request.num_computed_tokens - num_scheduled_token,
+                    request.num_computed_tokens,
+                )
             if self.defer_block_free:
                 # Record the in-flight step, to fence deferred block freeing.
                 request.last_sched_seq = self.sched_step_seq
@@ -2987,6 +3113,19 @@ class Scheduler(SchedulerInterface):
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
+            plan = scheduler_output.layered_prefill_plan
+            if (
+                plan is not None
+                and plan.is_sampling_step
+                and req_id in plan.prefill_req_ids
+                and not generated_token_ids
+            ):
+                logger.warning(
+                    "pp_chunk_empty_sample req=%s scheduled=%s computed=%s",
+                    req_id,
+                    num_tokens_scheduled,
+                    request.num_computed_tokens,
+                )
 
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
