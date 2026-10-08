@@ -353,6 +353,29 @@ def test_plan_chunk_only_samples_on_last_chunk():
     assert last.is_sampling_step is True
 
 
+def test_plan_chunk_respects_max_chunk_tokens():
+    config = _config(layers=8)
+    config.scheduler_config = SimpleNamespace(max_num_batched_tokens=16392)
+    config.additional_config["scheduler_config"]["layered_prefill_config"][
+        "max_chunk_tokens"
+    ] = 4096
+    policy = LayeredPrefillPolicy(config)
+    request = SimpleNamespace(
+        request_id="req",
+        num_prompt_tokens=16392,
+        num_computed_tokens=0,
+        layered_prefill_enabled=False,
+        layered_prefill_group_id=0,
+        layered_prefill_num_groups=0,
+        layered_prefill_query_tokens=0,
+        layered_prefill_cohort_id=-1,
+        layered_prefill_kv_reserved=False,
+        layered_prefill_cached_tokens=0,
+    )
+    policy.initialize_request(request)
+    assert request.layered_prefill_query_tokens == 4096
+
+
 def test_plan_chunk_caps_query_after_prefix_hit():
     config = _config(layers=8)
     config.scheduler_config = SimpleNamespace(max_num_batched_tokens=512)

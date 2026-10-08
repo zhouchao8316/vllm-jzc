@@ -104,6 +104,10 @@ class LayeredPrefillConfig:
     # Soft cap on a P group while decode is present, in milliseconds.
     # 0 = unlimited. Not a hard realtime guarantee.
     p_group_decode_budget_ms: float = 0.0
+    # Max tokens in one layered chunk. 0 uses the engine
+    # max_num_batched_tokens only. A positive value also caps that engine
+    # budget on Ascend so the profiled activation width matches the chunk.
+    max_chunk_tokens: int = 0
 
     def __post_init__(self) -> None:
         groups = tuple(sorted(set(int(v) for v in self.allowed_num_groups)))
@@ -116,6 +120,10 @@ class LayeredPrefillConfig:
         if self.p_group_decode_budget_ms < 0:
             raise ValueError(
                 "layered_prefill_config.p_group_decode_budget_ms must be >= 0"
+            )
+        if self.max_chunk_tokens < 0:
+            raise ValueError(
+                "layered_prefill_config.max_chunk_tokens must be >= 0"
             )
         if self.mode not in ("one_group", "adaptive"):
             raise ValueError(
@@ -187,6 +195,7 @@ class LayeredPrefillConfig:
             p_group_decode_budget_ms=float(
                 raw.get("p_group_decode_budget_ms", 0.0) or 0.0
             ),
+            max_chunk_tokens=int(raw.get("max_chunk_tokens", 0) or 0),
         )
 
 
@@ -618,6 +627,9 @@ class LayeredPrefillPolicy:
         query_tokens = remaining
         if self.max_num_batched_tokens > 0:
             query_tokens = min(query_tokens, self.max_num_batched_tokens)
+        chunk_cap = int(getattr(self.config, "max_chunk_tokens", 0) or 0)
+        if chunk_cap > 0:
+            query_tokens = min(query_tokens, chunk_cap)
         num_groups = select_num_groups(
             query_tokens,
             self.num_hidden_layers,
