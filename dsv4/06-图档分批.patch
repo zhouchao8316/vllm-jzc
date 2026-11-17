@@ -1,0 +1,368 @@
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index ee91753..6de443a 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1,6 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import itertools
++import json
++import os
+ import time
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+@@ -9,6 +11,7 @@ from typing import Any
+ 
+ from vllm.compilation.cuda_graph import CUDAGraphStat
+ from vllm.config import KVEventsConfig, VllmConfig
++from vllm.config.compilation import CUDAGraphMode
+ from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerConnector
+ from vllm.distributed.ec_transfer.ec_connector.base import (
+     ECConnectorBase,
+@@ -38,6 +41,10 @@ from vllm.v1.core.encoder_cache_manager import (
+ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+ from vllm.v1.core.kv_cache_utils import KVCacheBlock
++from vllm.v1.core.sched.decode_tiers import (
++    minimum_decode_phase_delays,
++    select_decode_tier_split,
++)
+ from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
+ from vllm.v1.core.sched.output import (
+     CachedRequestData,
+@@ -364,6 +371,48 @@ class Scheduler(SchedulerInterface):
+         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
+         # cadence (`next_decode_eligible_step`).
+         self.current_step = 0
++        # Opt-in. In a pure-decode window, delay the fewest requests so the
++        # two PP phases land on captured graph sizes. Unset leaves stock.
++        self._decode_balance = (
++            os.environ.get("VLLM_DECODE_BALANCE", "").strip().lower()
++        )
++        self._decode_tier_sizes: tuple[int, ...] = ()
++        self._decode_balance_logged = False
++        if self._decode_balance == "tiers":
++            compilation = vllm_config.compilation_config
++            self._decode_tier_sizes = tuple(
++                sorted(
++                    {
++                        size
++                        for size in compilation.cudagraph_capture_sizes or ()
++                        if 0 < size <= self.scheduler_config.max_num_seqs
++                    }
++                )
++            )
++            if not (
++                self.parallel_config.pipeline_parallel_size == 2
++                and self.use_v2_model_runner
++                and self.scheduler_config.async_scheduling
++                and vllm_config.speculative_config is None
++                and compilation.cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
++                and self._decode_tier_sizes
++            ):
++                logger.warning(
++                    "Decode tiers disabled: requires PP2, V2, async, no "
++                    "speculation, and captured full decode graphs"
++                )
++                self._decode_balance = ""
++            else:
++                logger.info(
++                    "Decode balance tiers: pure-decode targets use graph sizes %s",
++                    self._decode_tier_sizes,
++                )
++        elif self._decode_balance:
++            logger.warning(
++                "Unknown VLLM_DECODE_BALANCE=%s; leaving stock cadence",
++                self._decode_balance,
++            )
++            self._decode_balance = ""
+         # DP prefill balancing: Flag to track whether the last cadence-aligned
+         # prefill batch fully drained the waiting queue. Prefill throttling
+         # is disabled in this case.
+@@ -618,8 +667,106 @@ class Scheduler(SchedulerInterface):
+             num_new_tokens -= self.num_prefill_lookahead - remaining
+         return max(num_new_tokens, 0)
+ 
++
++    def _decode_output_complete(self, request: Request) -> bool:
++        return (
++            request.num_output_placeholders > 0
++            and request.num_computed_tokens + 2 - request.num_output_placeholders
++            >= request.num_prompt_tokens + request.max_tokens
++        )
++
++    def _maybe_balance_tiers(self) -> None:
++        """Delay the fewest requests so two decode phases match captured graphs.
++
++        Acts only when every running request has finished prefill and nothing
++        is waiting. Requests are never pulled earlier than their PP eligibility.
++        """
++        if self._decode_balance != "tiers":
++            return
++        if not self.use_pp or not self.use_v2_model_runner:
++            return
++        if len(self.waiting) != 0:
++            return
++        active: list[Request] = []
++        for request in self.running:
++            if request.num_computed_tokens < request.num_prompt_tokens:
++                return
++            if self._decode_output_complete(request):
++                continue
++            active.append(request)
++        if len(active) < 2:
++            return
++        now = self.current_step
++        for request in active:
++            if request.next_decode_eligible_step > now + 1:
++                return
++        due = [request for request in active if now >= request.next_decode_eligible_step]
++        wait1 = [
++            request
++            for request in active
++            if request.next_decode_eligible_step == now + 1
++        ]
++        if len(due) + len(wait1) != len(active):
++            return
++        target = select_decode_tier_split(len(active), self._decode_tier_sizes)
++        if target is None or sorted((len(due), len(wait1))) == sorted(target):
++            return
++        delays = minimum_decode_phase_delays(len(due), len(wait1), *target)
++        if delays is None:
++            return
++        delay_due, delay_next = delays
++        due_sorted = sorted(due, key=lambda request: request.request_id)
++        wait_sorted = sorted(wait1, key=lambda request: request.request_id)
++        delayed_due = due_sorted[-delay_due:] if delay_due else []
++        delayed_next = wait_sorted[-delay_next:] if delay_next else []
++        for request in delayed_due:
++            request.next_decode_eligible_step = now + 1
++        for request in delayed_next:
++            request.next_decode_eligible_step = now + 2
++        if not self._decode_balance_logged:
++            self._decode_balance_logged = True
++            logger.info(
++                "Decode balance tiers at step %s target=%s due=%s wait1=%s "
++                "delay_due=%s delay_next=%s",
++                now,
++                target,
++                len(due),
++                len(wait1),
++                delay_due,
++                delay_next,
++            )
++        sched_log = os.environ.get("VLLM_SCHED_LOG", "").strip()
++        if not sched_log:
++            return
++        try:
++            with open(sched_log, "a", encoding="utf-8") as handle:
++                handle.write(
++                    json.dumps(
++                        {
++                            "event": "balance",
++                            "balance_mode": "tiers",
++                            "target": list(target),
++                            "capture_sizes": list(self._decode_tier_sizes),
++                            "step": now,
++                            "t": round(time.perf_counter(), 6),
++                            "due": len(due),
++                            "wait1": len(wait1),
++                            "delay_due": delay_due,
++                            "delay_next": delay_next,
++                            "delay_due_ids": [request.request_id for request in delayed_due],
++                            "delay_next_ids": [
++                                request.request_id for request in delayed_next
++                            ],
++                        }
++                    )
++                    + "\n"
++                )
++        except OSError:
++            pass
++
+     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+         self.current_step += 1
++        self._maybe_balance_tiers()
+         # NOTE(woosuk) on the scheduling algorithm:
+         # There's no "decoding phase" nor "prefill phase" in the scheduler.
+         # Each request just has the num_computed_tokens and
+diff --git a/vllm/v1/core/sched/decode_tiers.py b/vllm/v1/core/sched/decode_tiers.py
+new file mode 100644
+index 0000000..54af1c1
+--- /dev/null
++++ b/vllm/v1/core/sched/decode_tiers.py
+@@ -0,0 +1,70 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Graph-tier targets and delay-only rebalancing for two decode phases."""
++
++from bisect import bisect_left
++from functools import lru_cache
++
++
++@lru_cache(maxsize=128)
++def select_decode_tier_split(
++    num_requests: int, capture_sizes: tuple[int, ...]
++) -> tuple[int, int] | None:
++    """Choose a split by padded capacity, larger graph, then full graph slots.
++
++    Small cohorts retain the balanced policy. This is a graph-capacity
++    heuristic, not a device-time predictor.
++    """
++    sizes = sorted({size for size in capture_sizes if size > 0})
++    if num_requests < 2 or not sizes or num_requests > 2 * sizes[-1]:
++        return None
++    if num_requests <= 2 * sizes[0]:
++        return (num_requests + 1) // 2, num_requests // 2
++
++    best: tuple[tuple[int, int, int, int], tuple[int, int]] | None = None
++    for light in range(1, num_requests // 2 + 1):
++        heavy = num_requests - light
++        heavy_index = bisect_left(sizes, heavy)
++        light_index = bisect_left(sizes, light)
++        if heavy_index == len(sizes) or light_index == len(sizes):
++            continue
++        heavy_graph, light_graph = sizes[heavy_index], sizes[light_index]
++        full_graphs = int(heavy == heavy_graph) + int(light == light_graph)
++        score = (
++            heavy_graph + light_graph,
++            heavy_graph,
++            -full_graphs,
++            heavy - light,
++        )
++        candidate = score, (heavy, light)
++        if best is None or candidate < best:
++            best = candidate
++    return None if best is None else best[1]
++
++
++def minimum_decode_phase_delays(
++    due: int, waiting: int, heavy: int, light: int
++) -> tuple[int, int] | None:
++    """Return the fewest one-step delays needed to reach either orientation.
++
++    The first result delays due requests to the next step; the second delays
++    next-step requests by one further step. Neither operation runs early.
++    """
++    if (
++        min(due, waiting) < 0
++        or min(heavy, light) < 1
++        or due + waiting != heavy + light
++        or sorted((due, waiting)) == sorted((heavy, light))
++    ):
++        return None
++    candidates = []
++    for first_phase in (heavy, light):
++        difference = first_phase - due
++        delay_due = max(0, -difference)
++        delay_next = max(0, difference)
++        if delay_due <= due and delay_next <= waiting:
++            candidates.append((delay_due + delay_next, delay_due, delay_next))
++    if not candidates:
++        return None
++    _, delay_due, delay_next = min(candidates)
++    return delay_due, delay_next
+diff --git a/tests/v1/core/test_decode_tiers.py b/tests/v1/core/test_decode_tiers.py
+new file mode 100644
+index 0000000..35cf985
+--- /dev/null
++++ b/tests/v1/core/test_decode_tiers.py
+@@ -0,0 +1,98 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""CPU-only checks for measured graph-tier targets and safe phase movement."""
++
++import pytest
++
++from vllm.v1.core.sched.decode_tiers import (
++    minimum_decode_phase_delays,
++    select_decode_tier_split,
++)
++
++pytestmark = pytest.mark.cpu_test
++
++
++@pytest.mark.parametrize(
++    ("active", "expected"),
++    [(8, (4, 4)), (9, (5, 4)), (10, (6, 4)), (11, (7, 4)),
++     (12, (8, 4)), (13, (8, 5))],
++)
++def test_reproduces_measured_targets(active, expected):
++    assert select_decode_tier_split(active, (4, 8, 12)) == expected
++
++
++@pytest.mark.parametrize("active", range(2, 9))
++def test_small_cohorts_keep_existing_balanced_policy(active):
++    assert select_decode_tier_split(active, (4, 8)) == (
++        (active + 1) // 2, active // 2
++    )
++
++
++def test_uses_actual_capture_sizes_instead_of_assuming_all_multiples_of_four():
++    assert select_decode_tier_split(12, (4, 8, 12)) == (8, 4)
++    assert select_decode_tier_split(12, (4, 6, 8, 12)) == (6, 6)
++    assert select_decode_tier_split(13, (4, 8)) == (8, 5)
++
++
++@pytest.mark.parametrize("sizes", [(), (0,), (-4, 0), (4,)])
++def test_does_not_invent_uncaptured_graphs(sizes):
++    assert select_decode_tier_split(13, sizes) is None
++
++
++@pytest.mark.parametrize("active", [0, 1])
++def test_does_not_split_a_single_request(active):
++    assert select_decode_tier_split(active, (4, 8, 12)) is None
++
++
++@pytest.mark.parametrize("active", range(2, 25))
++def test_targets_preserve_all_requests_and_fit_captured_graphs(active):
++    heavy, light = select_decode_tier_split(active, (4, 8, 12))
++    assert heavy >= light >= 1
++    assert heavy + light == active
++    assert heavy <= 12
++
++
++@pytest.mark.parametrize(
++    ("due", "waiting", "target", "expected"),
++    [(1, 11, (8, 4), (0, 3)),
++     (1, 12, (8, 5), (0, 4)),
++     (8, 0, (4, 4), (4, 0)),
++     (0, 12, (8, 4), (0, 4)),
++     (4, 8, (8, 4), None),
++     (8, 4, (8, 4), None),
++     (7, 5, (8, 4), (0, 1))],
++)
++def test_rebalances_by_minimum_delays_without_pulling_requests_forward(
++    due, waiting, target, expected
++):
++    assert minimum_decode_phase_delays(due, waiting, *target) == expected
++
++
++def test_delay_count_is_minimal_for_every_phase_layout():
++    for active in range(2, 25):
++        target = select_decode_tier_split(active, (4, 8, 12))
++        for due in range(active + 1):
++            waiting = active - due
++            delays = minimum_decode_phase_delays(due, waiting, *target)
++            if sorted((due, waiting)) == sorted(target):
++                assert delays is None
++                continue
++            delay_due, delay_next = delays
++            assert 0 <= delay_due <= due
++            assert 0 <= delay_next <= waiting
++            after = due - delay_due + delay_next, waiting + delay_due - delay_next
++            assert sorted(after) == sorted(target)
++            possible = [
++                x + y
++                for x in range(due + 1)
++                for y in range(waiting + 1)
++                if sorted((due - x + y, waiting + x - y)) == sorted(target)
++            ]
++            assert delay_due + delay_next == min(possible)
++
++
++@pytest.mark.parametrize(
++    "args", [(-1, 5, 4, 0), (3, 4, 4, 4), (4, 4, 8, 0)]
++)
++def test_invalid_phase_layout_is_left_unchanged(args):
++    assert minimum_decode_phase_delays(*args) is None

@@ -1,0 +1,393 @@
+diff --git a/vllm/v1/executor/multiproc_executor.py b/vllm/v1/executor/multiproc_executor.py
+index 749f46b428..65dcd7ae88 100644
+--- a/vllm/v1/executor/multiproc_executor.py
++++ b/vllm/v1/executor/multiproc_executor.py
+@@ -688,6 +688,29 @@ class WorkerProc:
+ 
+         scheduler_config = vllm_config.scheduler_config
+         self.use_async_scheduling = scheduler_config.async_scheduling
++        # Hold the sampled-token D2H sync until the next forward has been
++        # queued. Confirming first stalls the host submit of step N+1; doing
++        # it after the launch lets that sync overlap the N+1 compute.
++        # DeepInfra's overlapped runner uses the same order.
++        self._defer_output_confirm = (
++            os.environ.get("VLLM_DEFER_OUTPUT_CONFIRM", "1").strip().lower()
++            in {"1", "true", "yes"}
++        )
++        self._forward_gen = 0
++        self._forward_cv = threading.Condition()
++        # Gen id of the most recent execute_model on this worker; stamped onto
++        # the AsyncOutput from the matching sample_tokens RPC.
++        self._last_execute_gen = 0
++        # Opt-in confirm timing. One JSON line per sampled-token confirm.
++        self._confirm_log = os.environ.get("VLLM_CONFIRM_LOG", "").strip()
++        self._confirm_seq = 0
++        if self._confirm_log:
++            logger.info(
++                "Confirm timing log enabled path=%s defer=%s rank=%s",
++                self._confirm_log,
++                self._defer_output_confirm,
++                self.rank,
++            )
+         if self.use_async_scheduling:
+             self.async_output_queue: queue.Queue = queue.Queue()
+             self.async_output_copy_thread = Thread(
+@@ -988,14 +1011,151 @@ class WorkerProc:
+         SUCCESS = auto()
+         FAILURE = auto()
+ 
+-    def enqueue_output(self, output: Any):
++    def _record_confirm(
++        self,
++        confirm_ms: float,
++        wait_ms: float,
++        deferred: bool,
++        overlapped: bool | None,
++        sync_ms: float | None = None,
++        pack_ms: float | None = None,
++        extra: dict[str, Any] | None = None,
++    ) -> None:
++        if not self._confirm_log:
++            return
++        self._confirm_seq += 1
++        try:
++            import json as _json
++
++            row = {
++                "t": round(time.perf_counter(), 6),
++                "seq": self._confirm_seq,
++                "rank": self.rank,
++                "confirm_ms": round(confirm_ms, 3),
++                "wait_ms": round(wait_ms, 3),
++                "defer": int(deferred),
++                "overlapped": (
++                    None if overlapped is None else int(overlapped)
++                ),
++            }
++            if sync_ms is not None:
++                row["sync_ms"] = round(sync_ms, 3)
++            if pack_ms is not None:
++                row["pack_ms"] = round(pack_ms, 3)
++            if extra:
++                row.update(extra)
++            with open(self._confirm_log, "a", encoding="utf-8") as handle:
++                handle.write(_json.dumps(row) + "\n")
++        except OSError:
++            pass
++
++    @staticmethod
++    def _confirm_detail_ms(async_output: Any) -> tuple[float | None, float | None]:
++        """Pull sync/pack split off AsyncOutput or AscendAsyncOutput wrapper."""
++        for obj in (async_output, getattr(async_output, "_inner", None)):
++            if obj is None:
++                continue
++            sync_ms = getattr(obj, "_last_sync_ms", None)
++            pack_ms = getattr(obj, "_last_pack_ms", None)
++            if sync_ms is not None or pack_ms is not None:
++                return sync_ms, pack_ms
++        return None, None
++
++    @staticmethod
++    def _confirm_meta(async_output: Any) -> dict[str, Any]:
++        """Identity / batch / device-chain fields for wrong-next checks."""
++        meta: dict[str, Any] = {}
++        for obj in (async_output, getattr(async_output, "_inner", None)):
++            if obj is None:
++                continue
++            if "result_gen" not in meta and getattr(obj, "result_gen", None) is not None:
++                meta["result_gen"] = int(obj.result_gen)
++            if "n_req" not in meta and getattr(obj, "n_req", None) is not None:
++                meta["n_req"] = int(obj.n_req)
++            if "n_decode" not in meta and getattr(obj, "n_decode", None) is not None:
++                meta["n_decode"] = int(obj.n_decode)
++            if "n_tok" not in meta and getattr(obj, "n_tok", None) is not None:
++                meta["n_tok"] = int(obj.n_tok)
++            req_ids = getattr(obj, "req_ids", None)
++            if "req_ids" not in meta and req_ids is not None:
++                # Cap length so the jsonl stays readable under wide batches.
++                meta["req_ids"] = list(req_ids)[:8]
++            for key, attr in (
++                ("sample_to_copy_start_ms", "_last_sample_to_copy_start_ms"),
++                ("copy_ms", "_last_copy_ms"),
++                ("sample_to_copy_end_ms", "_last_sample_to_copy_end_ms"),
++            ):
++                if key in meta:
++                    continue
++                val = getattr(obj, attr, None)
++                if val is not None:
++                    meta[key] = round(float(val), 3)
++        return meta
++
++    @staticmethod
++    def _stamp_result_gen(output: Any, result_gen: int) -> None:
++        for obj in (output, getattr(output, "_inner", None)):
++            if obj is None:
++                continue
++            if isinstance(obj, AsyncModelRunnerOutput) or hasattr(obj, "result_gen"):
++                obj.result_gen = result_gen
++
++    def enqueue_output(
++        self,
++        output: Any,
++        wait_ms: float = 0.0,
++        deferred: bool = False,
++        overlapped: bool | None = None,
++        wait_seen: int | None = None,
++        wait_wake: int | None = None,
++        wait_anchor: int | None = None,
++    ):
+         """Prepares output from the worker and enqueues it to the
+         worker_response_mq. If the output is an Exception, it is
+         converted to a FAILURE response.
+         """
+         if isinstance(output, AsyncModelRunnerOutput):
+             try:
++                async_output = output
++                started = time.perf_counter()
+                 output = output.get_output()
++                confirm_ms = (time.perf_counter() - started) * 1000.0
++                sync_ms, pack_ms = self._confirm_detail_ms(async_output)
++                extra = self._confirm_meta(async_output)
++                if wait_seen is not None:
++                    extra["wait_seen"] = int(wait_seen)
++                if wait_wake is not None:
++                    extra["wait_wake"] = int(wait_wake)
++                if wait_anchor is not None:
++                    extra["wait_anchor"] = int(wait_anchor)
++                result_gen = extra.get("result_gen")
++                if (
++                    result_gen is not None
++                    and wait_seen is not None
++                    and deferred
++                ):
++                    # gen_lag: how far the dequeue-time counter was ahead of
++                    # the producing forward (informational; often 1 under 4+4).
++                    # wrong_next: wait anchored past result_gen (should be 0
++                    # after binding wait to result_gen).
++                    # next_already: result_gen+1 was already queued at dequeue.
++                    extra["gen_lag"] = int(wait_seen) - int(result_gen)
++                    anchor = (
++                        int(wait_anchor)
++                        if wait_anchor is not None
++                        else int(wait_seen)
++                    )
++                    extra["wrong_next"] = int(anchor > int(result_gen))
++                    extra["next_already"] = int(int(wait_seen) > int(result_gen))
++                self._record_confirm(
++                    confirm_ms,
++                    wait_ms,
++                    deferred,
++                    overlapped,
++                    sync_ms=sync_ms,
++                    pack_ms=pack_ms,
++                    extra=extra,
++                )
+             except Exception as e:
+                 logger.exception("Error getting async model runner output")
+                 output = e
+@@ -1017,6 +1177,22 @@ class WorkerProc:
+         else:
+             self.enqueue_output(output)
+ 
++    def _note_forward_queued(self) -> int:
++        with self._forward_cv:
++            self._forward_gen += 1
++            self._last_execute_gen = self._forward_gen
++            self._forward_cv.notify_all()
++            return self._forward_gen
++
++    def _wait_for_next_forward(self, seen: int, timeout_s: float = 0.1) -> bool:
++        """Wait until a forward queued after ``seen``. True when one was."""
++        with self._forward_cv:
++            if self._forward_gen > seen:
++                return True
++            return self._forward_cv.wait_for(
++                lambda: self._forward_gen > seen, timeout=timeout_s
++            )
++
+     def async_output_busy_loop(self):
+         """Entrypoint for the thread which handles outputs asynchronously."""
+         # set device to the worker device for the thread.
+@@ -1030,9 +1206,49 @@ class WorkerProc:
+         if hasattr(self.worker, "device"):
+             current_platform.set_device(self.worker.device)
+ 
++        logged_overlap = False
+         while True:
+             output = self.async_output_queue.get()
+-            self.enqueue_output(output)
++            wait_ms = 0.0
++            deferred = False
++            overlapped: bool | None = None
++            wait_seen: int | None = None
++            wait_wake: int | None = None
++            wait_anchor: int | None = None
++            if (
++                self._defer_output_confirm
++                and isinstance(output, AsyncModelRunnerOutput)
++            ):
++                deferred = True
++                # Anchor on the producing forward's gen, not the dequeue-time
++                # counter. If result_gen=100 and 101 is already queued, proceed
++                # immediately; do not wait for 102.
++                result_gen = getattr(output, "result_gen", None)
++                with self._forward_cv:
++                    wait_seen = self._forward_gen
++                wait_anchor = (
++                    int(result_gen) if result_gen is not None else int(wait_seen)
++                )
++                wait_started = time.perf_counter()
++                overlapped = self._wait_for_next_forward(wait_anchor)
++                wait_ms = (time.perf_counter() - wait_started) * 1000.0
++                with self._forward_cv:
++                    wait_wake = self._forward_gen
++                if overlapped and not logged_overlap:
++                    logged_overlap = True
++                    logger.info(
++                        "Deferred sampled-token confirm until the next "
++                        "forward is queued"
++                    )
++            self.enqueue_output(
++                output,
++                wait_ms=wait_ms,
++                deferred=deferred,
++                overlapped=overlapped,
++                wait_seen=wait_seen,
++                wait_wake=wait_wake,
++                wait_anchor=wait_anchor,
++            )
+ 
+     def worker_busy_loop(self):
+         """Main busy loop for Multiprocessing Workers."""
+@@ -1053,6 +1269,16 @@ class WorkerProc:
+                 func = partial(cloudpickle.loads(method), self.worker)
+ 
+             output = func(*args, **kwargs)
++            # Release a held confirm only after this forward's kernels are
++            # queued, so the D2H sync overlaps step N+1 rather than preceding
++            # its prepare.
++            if method == "execute_model":
++                self._note_forward_queued()
++            elif method == "sample_tokens":
++                # AsyncOutput is produced here; bind it to the execute_model
++                # gen that fed this sample so defer can be audited for
++                # wrong-next waits.
++                self._stamp_result_gen(output, self._last_execute_gen)
+ 
+             if output_rank is None or self.rank == output_rank:
+                 self.handle_output(output)
+diff --git a/vllm/v1/worker/gpu/async_utils.py b/vllm/v1/worker/gpu/async_utils.py
+index 0d6481585e..fd38e1299e 100644
+--- a/vllm/v1/worker/gpu/async_utils.py
++++ b/vllm/v1/worker/gpu/async_utils.py
+@@ -122,6 +122,9 @@ class AsyncOutput(AsyncModelRunnerOutput):
+         copy_stream: torch.cuda.Stream,
+         check_ep_fault: bool,
+         pending_aux_output: "PendingAuxOutput | None",
++        sample_end_event: torch.cuda.Event | None = None,
++        n_decode: int | None = None,
++        n_tok: int | None = None,
+     ):
+         # NOTE(woosuk): We must retain references to the GPU tensors,
+         # as the copy operations are performed on a different CUDA stream than
+@@ -130,12 +133,23 @@ class AsyncOutput(AsyncModelRunnerOutput):
+         self.sampler_output = sampler_output
+         self.num_sampled_tokens = num_sampled_tokens
+         self.pending_aux_output = pending_aux_output
++        # Identity / batch width for confirm-wait correlation.
++        self.req_ids = list(model_runner_output.req_ids)
++        self.n_req = len(self.req_ids)
++        self.n_decode = n_decode
++        self.n_tok = n_tok
++        # Stamped by the executor when the producing execute_model is queued.
++        self.result_gen: int | None = None
+         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
+-        self.copy_event = torch.cuda.Event(blocking=True)
++        # enable_timing so sample→copy chain can be measured after sync.
++        self.copy_event = torch.cuda.Event(blocking=True, enable_timing=True)
++        self._sample_end_event = sample_end_event
++        self._copy_start_event = torch.cuda.Event(enable_timing=True)
+         self._has_fault: torch.Tensor | None = None
+ 
+         with stream(copy_stream, main_stream):
+             copy_stream.wait_stream(main_stream)
++            self._copy_start_event.record(copy_stream)
+ 
+             self.sampled_token_ids = async_copy_to_np(sampler_output.sampled_token_ids)
+             self.logprobs_tensors: LogprobsTensors | None = None
+@@ -171,8 +185,33 @@ class AsyncOutput(AsyncModelRunnerOutput):
+             self.copy_event.record(copy_stream)
+ 
+     def get_output(self) -> ModelRunnerOutput:
++        # Split wall time so callers can tell copy-wait from CPU packing.
++        # Opt-in consumers read `_last_sync_ms` / `_last_pack_ms`.
++        import time as _time
++
++        sync_started = _time.perf_counter()
+         self.copy_event.synchronize()
++        self._last_sync_ms = (_time.perf_counter() - sync_started) * 1000.0
++        # Device-side sample-end → copy-start → copy-end (ms). None if events
++        # unavailable (e.g. Ascend timing not supported for this Event).
++        self._last_sample_to_copy_start_ms: float | None = None
++        self._last_copy_ms: float | None = None
++        self._last_sample_to_copy_end_ms: float | None = None
++        if self._sample_end_event is not None:
++            try:
++                self._last_sample_to_copy_start_ms = float(
++                    self._sample_end_event.elapsed_time(self._copy_start_event)
++                )
++                self._last_copy_ms = float(
++                    self._copy_start_event.elapsed_time(self.copy_event)
++                )
++                self._last_sample_to_copy_end_ms = float(
++                    self._sample_end_event.elapsed_time(self.copy_event)
++                )
++            except Exception:
++                pass
+ 
++        pack_started = _time.perf_counter()
+         # NOTE(woosuk): The following code is to ensure compatibility with
+         # the existing model runner.
+         # Going forward, we should keep the data structures as NumPy arrays
+@@ -214,6 +253,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
+                 f"Mask: {mask.cpu().tolist()}"
+             )
+ 
++        self._last_pack_ms = (_time.perf_counter() - pack_started) * 1000.0
+         return self.model_runner_output
+ 
+ 
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 1b75d73493..6fe745f5bc 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -2196,6 +2196,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         if self.aux_output_connector is not None:
+             pending_aux_output = self.aux_output_connector.prepare_output(input_batch)
+ 
++        # Mark sample completion on the compute stream before the copy stream
++        # waits on it; elapsed_time against copy_start/copy_end answers how
++        # much of confirm sync is sample→copy vs pure D2H.
++        sample_end_event = torch.cuda.Event(enable_timing=True)
++        sample_end_event.record(self.main_stream)
++        n_req = len(input_batch.req_ids)
++        qsl = input_batch.query_start_loc_np[: n_req + 1]
++        n_tok = int(qsl[-1] - qsl[0]) if len(qsl) > 1 else 0
++        # Decode-ish rows: single scheduled token (prefill chunks are wider).
++        n_decode = int(
++            sum(1 for i in range(len(qsl) - 1) if int(qsl[i + 1] - qsl[i]) == 1)
++        )
++
+         # Start async output copy here so that it can overlap with speculator proposal.
+         async_output = AsyncOutput(
+             model_runner_output=model_runner_output,
+@@ -2205,6 +2218,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             copy_stream=self.output_copy_stream,
+             check_ep_fault=self.check_ep_fault,
+             pending_aux_output=pending_aux_output,
++            sample_end_event=sample_end_event,
++            n_decode=n_decode,
++            n_tok=n_tok,
+         )
+ 
+         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
